@@ -23,6 +23,7 @@ from study_planner import (
     paper,
     planner,
     progress as progress_mod,
+    proxy,
     render,
 )
 from study_planner.knowledge import ITEM_BY_ID, ITEMS, TRACKS, TRACK_BY_ID
@@ -448,6 +449,11 @@ _READER_LAYOUT = r"""<!doctype html>
   .fcard a.rbtn2 { display:inline-block; margin-top:12px; padding:8px 18px; border-radius:16px;
     background:var(--accent); color:#fff; text-decoration:none; font-size:13px; }
 
+  #selPill { position:fixed; z-index:60; display:none; background:var(--accent); color:#fff;
+    border:none; border-radius:14px; padding:4px 11px; font-size:12px; cursor:pointer;
+    box-shadow:0 2px 10px rgba(59,126,161,.4); white-space:nowrap; }
+  #selPill:hover { background:var(--accent-dark); }
+
   #gutter { flex:0 0 5px; background:var(--line); cursor:col-resize; }
   #gutter:hover { background:#c4d6e0; }
 
@@ -484,6 +490,23 @@ _READER_LAYOUT = r"""<!doctype html>
   .bubble.sys { background:transparent; color:var(--muted); font-size:12px;
     text-align:center; max-width:100%; margin:6px 0; }
 
+  #quoteBar { display:none; padding:9px 10px 0; }
+  #quoteBar.on { display:block; }
+  .qchip { position:relative; background:#eef4f8; border:1px solid #d8e6ee; border-radius:10px;
+    padding:7px 26px 7px 10px; font-size:12px; color:#4a5b66; line-height:1.55; }
+  .qchip .qtext { display:block; max-height:52px; overflow:hidden; color:var(--ink);
+    font-size:12.5px; }
+  .qchip .qmeta { display:block; margin-top:3px; color:var(--muted); font-size:11px; }
+  .qchip .qmeta.warn { color:var(--warn); }
+  .qchip .qx { position:absolute; top:4px; right:6px; border:none; background:none;
+    cursor:pointer; color:var(--muted); font-size:14px; line-height:1; padding:2px 4px; }
+  .qchip .qx:hover { color:#a33; }
+
+  /* 用户气泡里的引用：只露一小段，不然一次几千字会把对话区刷屏 */
+  .bubble.user .uquote { display:block; border-left:3px solid rgba(255,255,255,.55);
+    padding-left:8px; margin-bottom:6px; opacity:.85; font-size:12.5px;
+    max-height:110px; overflow:hidden; }
+
   #composer { border-top:1px solid var(--line); padding:10px; display:flex; gap:8px;
     align-items:flex-end; }
   #input { flex:1 1 auto; resize:none; border:1px solid var(--line); border-radius:10px;
@@ -514,6 +537,7 @@ _READER_LAYOUT = r"""<!doctype html>
     <iframe id="paperFrame" title="原文"></iframe>
     <div id="readmeWrap"></div>
     <div id="fallbackCard"><div class="fcard" id="fallbackInner"></div></div>
+    <button id="selPill" type="button">❓ 问 AI</button>
   </section>
 
   <div id="gutter" title="拖动调整宽度"></div>
@@ -524,8 +548,9 @@ _READER_LAYOUT = r"""<!doctype html>
       <button class="rbtn" id="fullBtn">载入全文</button>
     </div>
     <div id="msgs"></div>
+    <div id="quoteBar"></div>
     <div id="composer">
-      <textarea id="input" rows="1" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <textarea id="input" rows="1" placeholder="问点什么…（选中左边一段可以直接问，Enter 发送）"></textarea>
       <button id="sendBtn">发送</button>
     </div>
   </section>
@@ -552,11 +577,13 @@ function esc(s) {
 
 /* ---------------- 左栏 ---------------- */
 (function initLeft() {
-  document.getElementById('linkSource').href = DOC.url || '#';
+  /* arxiv 条目指向代理页（同源）而不是 arxiv.org——跨域 iframe 读不到选区，
+     划词功能就无从实现。详见 study_planner/proxy.py 的模块说明。 */
+  document.getElementById('linkSource').href = DOC.source_url || DOC.url || '#';
   document.getElementById('docMeta').textContent = DOC.track || '';
 
-  if (DOC.kind === 'arxiv' && DOC.embed_url) {
-    document.getElementById('paperFrame').src = DOC.embed_url;
+  if (DOC.frame_url) {
+    document.getElementById('paperFrame').src = DOC.frame_url;
     if (DOC.pdf_url) {
       const p = document.getElementById('linkPdf');
       p.href = DOC.pdf_url;
@@ -579,6 +606,146 @@ function esc(s) {
     '<a class="rbtn2" target="_blank" rel="noopener" href="' + esc(DOC.url) + '">在新标签页打开 ↗</a>';
   document.getElementById('fallbackCard').style.display = 'flex';
 })();
+
+/* ---------------- 划词提问 ----------------
+   两条来源：左栏 iframe（arXiv 论文，脚本由 proxy.py 注入、postMessage 上来）
+   和父文档里的 README（GitHub 条目，选区就是普通的本页选区）。 */
+const pill = document.getElementById('selPill');
+const paneLeft = document.getElementById('pane-left');
+const quoteBar = document.getElementById('quoteBar');
+let pendingQuote = null;
+
+function squash(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+
+/* 取「文档顺序里最后一个位于选区之前的标题」。
+   render.md_to_html 输出的是扁平的 h3–h6，这一招照样通吃。 */
+function headingBeforeIn(scope, node) {
+  const hs = scope.querySelectorAll('h1,h2,h3,h4,h5,h6');
+  let best = '';
+  for (const h of hs) {
+    if (h.contains(node)) return squash(h.textContent);
+    if (h.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      best = squash(h.textContent);
+    }
+  }
+  return best;
+}
+
+function hidePill() { pill.style.display = 'none'; pill.onclick = null; }
+
+function showPill(sel) {
+  const pr = paneLeft.getBoundingClientRect();
+  const top = sel.rect.bottom + 6;
+  const left = Math.min(Math.max(sel.rect.left, pr.left + 8), pr.right - 76);
+  /* 选中那行已经滚出左栏了就不显示，而不是夹到一个会误导人的位置 */
+  if (top < pr.top + 4 || top > pr.bottom - 30) return hidePill();
+  pill.style.top = top + 'px';
+  pill.style.left = left + 'px';
+  pill.style.display = 'block';
+  pill.onclick = () => { attachQuote(sel); hidePill(); };
+}
+
+function clearQuote() {
+  pendingQuote = null;
+  quoteBar.textContent = '';
+  quoteBar.className = '';
+}
+
+function attachQuote(sel) {
+  pendingQuote = sel;
+  quoteBar.textContent = '';
+  quoteBar.className = 'on';
+
+  /* 整条引用栏都用 createElement + textContent 构建。
+     **绝不能用 innerHTML**：这段文字来自 arXiv 的页面，是外部输入。 */
+  const box = document.createElement('div');
+  box.className = 'qchip';
+
+  const t = document.createElement('span');
+  t.className = 'qtext';
+  t.textContent = '❝ ' + (sel.text.length > 90 ? sel.text.slice(0, 90) + '…' : sel.text) + ' ❞';
+  box.appendChild(t);
+
+  const meta = document.createElement('span');
+  meta.className = 'qmeta';
+  meta.textContent = (sel.heading ? '选自 ' + sel.heading + ' · ' : '') + sel.text.length + ' 字';
+  box.appendChild(meta);
+
+  if (sel.truncated) {
+    const w = document.createElement('span');
+    w.className = 'qmeta warn';
+    w.textContent = '已截断，只发送前 ' + DOC.quote_max + ' 字';
+    box.appendChild(w);
+  }
+
+  const x = document.createElement('button');
+  x.className = 'qx'; x.type = 'button'; x.textContent = '×'; x.title = '取消引用';
+  x.onclick = clearQuote;
+  box.appendChild(x);
+
+  quoteBar.appendChild(box);
+
+  /* 预填「这一段是什么意思？」并整段选中：直接回车就是问这句，直接打字就替换成
+     自己的问题，两种都顺手。但绝不覆盖已经写了一半的内容——那很讨厌。 */
+  if (!inputEl.value.trim()) {
+    inputEl.value = '这一段是什么意思？';
+    inputEl.focus();
+    inputEl.setSelectionRange(0, inputEl.value.length);
+    inputEl.dispatchEvent(new Event('input'));   // 触发已有的自动撑高
+  }
+}
+
+window.addEventListener('message', e => {
+  const frame = document.getElementById('paperFrame');
+  if (e.origin !== window.location.origin) return;
+  if (e.source !== frame.contentWindow) return;      // 只认左栏那个 iframe
+  const d = e.data || {};
+  if (d.from !== 'paper-bridge') return;
+
+  if (!d.sel) return hidePill();
+  /* 子文档里的坐标是它自己视口的，加上 iframe 在父页面里的偏移才是父页面坐标 */
+  const fr = frame.getBoundingClientRect();
+  showPill({
+    text: d.sel.text, truncated: d.sel.truncated, heading: d.sel.heading,
+    rect: {
+      top: d.sel.rect.top + fr.top, bottom: d.sel.rect.bottom + fr.top,
+      left: d.sel.rect.left + fr.left, right: d.sel.rect.right + fr.left
+    }
+  });
+});
+
+document.addEventListener('mouseup', e => setTimeout(() => {
+  /* 点浮标自己也算一次 mouseup。不排掉的话，在 README 上点「问 AI」之后，
+     如果浏览器没把原选区清掉，浮标会立刻又冒出来。 */
+  if (e.target === pill) return;
+
+  /* 白名单只认 README 里面的选区：右侧聊天区、输入框里的选择天然不触发，
+     不用去逐个排除 #pane-right / #msgs / #input。 */
+  const wrap = document.getElementById('readmeWrap');
+  if (!wrap || wrap.style.display === 'none') return hidePill();
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return hidePill();
+  const range = sel.getRangeAt(0);
+  if (!wrap.contains(range.commonAncestorContainer)) return hidePill();
+  const raw = range.toString();
+  if (!raw.trim()) return hidePill();
+
+  const rects = range.getClientRects();
+  const r = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+  const node = range.startContainer.nodeType === 3
+    ? range.startContainer.parentNode : range.startContainer;
+  showPill({
+    text: squash(raw).slice(0, DOC.quote_max),
+    truncated: raw.length > DOC.quote_max,
+    heading: headingBeforeIn(wrap, node),
+    rect: { top: r.top, bottom: r.bottom, left: r.left, right: r.right }
+  });
+}), 0);
+
+/* 固定定位的浮标锚在算好的坐标上，窗口一变大或分栏一拖就指向错的地方——
+   与其显示一个错的，不如收起来 */
+window.addEventListener('resize', hidePill);
+document.getElementById('gutter').addEventListener('mousedown', hidePill);
 
 /* ---------------- 上下文档位 ---------------- */
 function updateCtx(announce) {
@@ -624,14 +791,39 @@ async function renderMd(text) {
 
 async function send() {
   const text = inputEl.value.trim();
-  if (!text || busy) return;
+  const q = pendingQuote;
+  if ((!text && !q) || busy) return;   // 只贴了引用、没打字也允许发送
+
+  const question = text || '这一段是什么意思？';
+
+  /* 引用拼进 user 消息正文，跟着 history 一起发——服务端因此不需要知道
+     「引用」这个概念，接口形状零变化。
+     截断要同时告诉人和模型（引用栏上一处、这里一处），不能只告诉一边。 */
+  let content = question;
+  if (q) {
+    content = (q.heading ? DOC.quote_open + '（位置：' + q.heading + '）' : DOC.quote_open)
+      + '\n' + q.text
+      + (q.truncated ? '\n（原文过长，以上只是前 ' + DOC.quote_max + ' 字）' : '')
+      + '\n' + DOC.quote_close + '\n\n' + question;
+  }
 
   inputEl.value = '';
   busy = true;
   sendBtn.disabled = true;
+  clearQuote();
 
-  history.push({ role: 'user', content: text });
-  addBubble('user').textContent = text;
+  history.push({ role: 'user', content: content });
+
+  // 气泡里显示压缩版：几千字的引用全铺出来会把对话区刷屏
+  const ub = addBubble('user');
+  if (q) {
+    const qt = document.createElement('span');
+    qt.className = 'uquote';
+    qt.textContent = '❝ ' + (q.text.length > 80 ? q.text.slice(0, 80) + '…' : q.text) + ' ❞'
+      + (q.heading ? '（' + q.heading + '）' : '');
+    ub.appendChild(qt);
+  }
+  ub.appendChild(document.createTextNode(question));
 
   const out = addBubble('assistant');
   out.textContent = '思考中…';
@@ -734,9 +926,11 @@ updateCtx(false);
   let s = '我在看《' + DOC.title + '》';
   if (DOC.kind === 'arxiv') {
     s += '。刚开始我只能看到**摘要和章节目录**，问具体公式或实验数字答不上来——'
-       + '点上面的「载入全文」我就能读整篇了。';
+       + '点上面的「载入全文」我就能读整篇了。'
+       + '\n\n看到不懂的一段，**直接用鼠标在左边选中它**，会浮出一个「问 AI」，'
+       + '点一下就能就着那段话提问。';
   } else if (DOC.readme_html) {
-    s += ' 的 README。有不懂的地方直接问。';
+    s += ' 的 README。有不懂的地方直接选中一段，浮出「问 AI」就能就着它提问。';
   } else {
     s += '。左侧内容没能内嵌，但你可以照常问我。';
   }
@@ -766,13 +960,25 @@ def _reader_page(doc) -> str:
         "title": doc.title or doc.item_id,
         "track": track,
         "url": doc.url,
-        "embed_url": doc.embed_url,
+        # 「原文 ↗」指向真正的 arXiv 页面，作为代理渲染出问题时的逃生口
+        "source_url": (doc.embed_url or doc.url) if doc.kind == "arxiv" else doc.url,
+        # 左栏 iframe 的地址。arxiv 一律走同源代理，抓不到 HTML 时由代理自己
+        # 在 iframe 内部显示说明页——**不能**按 doc.error 把 iframe 关掉，
+        # 那样一次瞬时网络故障会把条目永久降级成摘要模式。
+        "frame_url": (
+            url_for("paper_frame", item_id=doc.item_id) if doc.kind == "arxiv" else ""
+        ),
         "pdf_url": doc.pdf_url,
         "readme_html": doc.readme_html,
         "error": doc.error,
         "full_chars": len(doc.full_text),
         "full_truncated": doc.full_truncated,
         "abstract_chars": len(doc.abstract),
+        # 引用的标记和上限都由服务端下发，保证前端拼出来的东西和
+        # _chat_system 里告诉模型的完全一致——两边各写一份迟早漂移。
+        "quote_open": config.QUOTE_OPEN,
+        "quote_close": config.QUOTE_CLOSE,
+        "quote_max": config.QUOTE_MAX_CHARS,
     }
 
     out = _READER_LAYOUT.replace("__DOC_JSON__", _json_for_script(payload))
@@ -809,6 +1015,9 @@ def _chat_system(doc, use_full: bool) -> str:
         parts.append(
             "\n注意：你目前**只看到了摘要和章节目录**，没有正文。"
             "所以公式编号、实验数字、表格数值这类细节你并不知道。"
+            f"\n**唯一的例外**：用户消息里被 {config.QUOTE_OPEN} 和 {config.QUOTE_CLOSE} "
+            "夹住的那一段，是他用鼠标从正文里选出来给你看的，等同于正文。"
+            "他多半就是在问这一段——基于它正常回答，不要说「我看不到正文」。"
         )
 
     parts += [
@@ -816,7 +1025,8 @@ def _chat_system(doc, use_full: bool) -> str:
         "【回答要求】",
         "1. 严格基于上面给你的内容 + 你自己的知识，不要脑补这篇论文里没有的东西。",
         "2. 涉及你看不到的具体细节（公式编号、实验数字、表格数值）时，"
-        "**直接说「这个我这边看不到」，并指出大概在哪一节**。绝对不要编造数字或公式。",
+        "**直接说「这个我这边看不到」，并指出大概在哪一节**。绝对不要编造数字或公式。"
+        f"但**只要那段内容出现在 {config.QUOTE_OPEN} 里，它就是你看得到的**，以它为准。",
         "3. 他正在左边读原文，回答时可以直接指路，例如「见 3.2 节」。",
         "4. 如果他的理解有偏差，直接指出来，不用顺着说。",
     ]
@@ -838,6 +1048,54 @@ def reader(item_id: str):
         ), 404
 
     return _reader_page(paper.load(item_id))
+
+
+@app.route("/paper/<item_id>")
+def paper_frame(item_id: str):
+    """左栏 iframe 的内容：arXiv 页面经 `proxy` 改写后的同源副本。
+
+    **函数名不能叫 `paper`**——模块顶部已经 `import paper` 了，同名的视图函数
+    会把它盖掉，后面所有 `paper.load()` 都会炸。
+
+    这个路由只会在 iframe 里被加载，所以「失败」的呈现方式是一张看得懂的说明页，
+    而不是 Flask 的错误页或者浏览器的网络错误页——那样用户只会看到一片空白。
+    """
+    if item_id not in ITEM_BY_ID:
+        return Response(
+            proxy.fallback_page(item_id, "找不到这个条目", "", "",
+                                "课程表里没有这个 id。"),
+            status=404, mimetype="text/html")
+
+    doc = paper.load(item_id)
+    if doc.kind != "arxiv":
+        return Response(
+            proxy.fallback_page(item_id, doc.title or item_id, doc.pdf_url, doc.url,
+                                "这个条目的左栏不是论文原文，看右侧问答就行。"),
+            mimetype="text/html")
+
+    arxiv_id = paper.arxiv_id_of(ITEM_BY_ID[item_id])
+    served = (
+        proxy.serve(item_id, arxiv_id, force=request.args.get("force") == "1")
+        if arxiv_id else None
+    )
+    if served is None:
+        return Response(
+            proxy.fallback_page(
+                item_id, doc.title or item_id, doc.pdf_url, doc.embed_url or doc.url,
+                doc.error or "没能抓到 arXiv 的 HTML 版，可能是网络不通。",
+            ),
+            mimetype="text/html")
+
+    html, csp = served
+    # mimetype 只给 "text/html"：Flask 会自己补 charset，写成
+    # "text/html; charset=utf-8" 会得到重复的 charset 段。
+    return Response(html, mimetype="text/html", headers={
+        "Content-Security-Policy": csp,
+        # 页面里带着本次响应现生成的 nonce，不能进浏览器缓存
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    })
 
 
 @app.route("/api/doc/<item_id>")
@@ -866,7 +1124,11 @@ def api_chat():
 
     raw_history = body.get("messages") or []
     messages = [
-        {"role": m.get("role"), "content": str(m.get("content"))[:8000]}
+        # 上限给到 12000 而不是 8000：一条消息里可能带着最长 QUOTE_MAX_CHARS
+        # 的引用片段，留出余量。卡在 8000 会把「引用 + 较长的问题」从中间静默
+        # 截断，而引用块自带的截断告知在更靠后的位置，正好被切掉——
+        # 模型就会以为它拿到的是完整段落。
+        {"role": m.get("role"), "content": str(m.get("content"))[:12000]}
         for m in raw_history
         if isinstance(m, dict)
         and m.get("role") in ("user", "assistant")

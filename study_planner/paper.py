@@ -26,6 +26,9 @@ from html.parser import HTMLParser
 from . import config, sources
 from .knowledge import ITEM_BY_ID, Item
 
+# arXiv 的 HTML 版正文所在的位置。proxy.py 也用它，所以是公开的。
+ARXIV_HTML_BASE = "https://arxiv.org/html/"
+
 # 从条目 URL 里认出 arXiv id
 _ARXIV_RE = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})")
 # 从条目 URL 里认出 GitHub 仓库
@@ -258,9 +261,13 @@ def _fetch_arxiv_meta(arxiv_id: str) -> tuple[str, str]:
     return "", ""
 
 
-def _fetch_arxiv_html(arxiv_id: str) -> str:
-    """取 arXiv 的 HTML 版正文。没有 HTML 版时返回空串。"""
-    raw = sources._get(f"https://arxiv.org/html/{arxiv_id}")
+def fetch_arxiv_html(arxiv_id: str) -> str:
+    """取 arXiv 的 HTML 版原始页面。没有 HTML 版时返回空串。
+
+    这里抓到的原文有两个用途：本模块剥出纯文本喂模型，`proxy` 模块改写成
+    能同源嵌入的版本给左栏 iframe。
+    """
+    raw = sources._get(f"{ARXIV_HTML_BASE}{arxiv_id}")
     if raw is None:
         return ""
     return raw.decode("utf-8", "ignore")
@@ -352,10 +359,9 @@ def _fill(doc: Doc, item: Item) -> None:
     arxiv_id = arxiv_id_of(item)
     if arxiv_id:
         doc.kind = "arxiv"
-        doc.embed_url = f"https://arxiv.org/html/{arxiv_id}"
         doc.pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
 
-        html = _fetch_arxiv_html(arxiv_id)
+        html = fetch_arxiv_html(arxiv_id)
         if not html:
             # 万一没有 HTML 版，退回 API 至少拿到标题和摘要（问答还能用）
             doc.error = "arXiv 没有提供这篇的 HTML 版，左栏打不开；问答只能基于下面的摘要。"
@@ -364,6 +370,10 @@ def _fill(doc: Doc, item: Item) -> None:
                 doc.title = title
             doc.abstract = abstract
             return
+
+        # 抓到了才算数。放在这个位置而不是抓取之前，是为了让缓存里的 embed_url
+        # 名副其实——没有 HTML 版的条目不该带着一个指向 404 的地址。
+        doc.embed_url = f"{ARXIV_HTML_BASE}{arxiv_id}"
 
         title = _extract_title(html)
         if title:
