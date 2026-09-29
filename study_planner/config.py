@@ -1,17 +1,26 @@
 """全局配置：所有路径都从项目根目录推导，保证任何地方运行都一致。"""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 # 项目根目录 = 本文件的上两级（也就是放着 app.py / cli.py 的那层）
 ROOT = Path(__file__).resolve().parent.parent
 
-# 数据目录
-DATA_DIR = ROOT / "data"
+# 数据目录。
+# 环境变量 STUDY_PLANNER_DATA_DIR 可以把它挪到别处——用途只有一个：测试，
+# 以及在不动真数据的前提下跑第二份。README 不教用户改它。
+DATA_DIR = Path(os.environ.get("STUDY_PLANNER_DATA_DIR") or (ROOT / "data"))
 CACHE_DIR = DATA_DIR / "cache"          # arXiv / GitHub 抓取缓存（按日期分文件）
 STATE_PATH = DATA_DIR / "state.json"    # 进度状态，CLI 和网页面板的唯一数据源
 DEAD_LINKS_PATH = DATA_DIR / "dead_links.txt"   # check-links 的产物
+
+# 用户画像 + 按画像生成的课程表。都在 data/ 下，所以天然被 gitignore，
+# 也不会跟着仓库分享出去。详见 cli.py profile。
+PROFILE_PATH = DATA_DIR / "profile.json"
+CURRICULUM_PATH = DATA_DIR / "curriculum.json"
+BACKUP_DIR = DATA_DIR / "backups"       # cli.py import 覆盖之前的自动备份
 
 # 论文/仓库正文的缓存。和抓取缓存不同：论文内容不会变，可以长期保留，
 # 不像 arXiv 列表那样按天过期。
@@ -74,6 +83,73 @@ def load_env_file(path=None) -> int:
             ENV_APPLIED_KEYS.append(key)
 
     return applied
+
+# --- 用户画像 -------------------------------------------------------------
+# 由 `cli.py profile` 写入。存在的话，下面几项抓取口味和每日预算会被它覆盖。
+PROFILE_FORMAT = "study-planner-profile"
+PROFILE_VERSION = 1
+
+# 当前生效的画像（空 dict = 没有画像，用内置口味）
+PROFILE: dict = {}
+
+
+def load_profile(path=None) -> dict:
+    """读 `data/profile.json`，把画像里的口味覆盖到本模块的常量上，返回画像本身。
+
+    **必须在 `study_planner/__init__.py` 里调用**，和 load_env_file 同一个位置、
+    同一个理由：等别的模块把 config 的属性读走之后再改就晚了。
+
+    覆盖能生效的前提：`sources.py` 读的是 `config.ARXIV_KEYWORDS` 这种
+    **属性访问**（不是 `from .config import ARXIV_KEYWORDS` 那种本地绑定）。
+    全仓库目前没人那么写，但这个前提很脆弱——改任何一处都要记得这一条。
+    """
+    global PROFILE
+
+    target = PROFILE_PATH if path is None else Path(path)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+    if not isinstance(data, dict) or data.get("format") != PROFILE_FORMAT:
+        return {}
+
+    PROFILE = data
+    apply_profile(data)
+    return data
+
+
+def apply_profile(profile: dict) -> list[str]:
+    """把画像应用到本模块的常量上，返回实际生效的键名。
+
+    **空列表不覆盖**，两个原因：
+    1. 空关键词会让 `sources._score` 恒为 0，把「新鲜事」整块打成永久空白，
+       而且不报任何错；
+    2. 「没填」和「故意清空」在这里没区别，而前者远多于后者。
+    """
+    global ARXIV_CATEGORIES, ARXIV_KEYWORDS, GITHUB_QUERIES, DAILY_MINUTES
+
+    applied: list[str] = []
+
+    for key, current in (
+        ("arxiv_categories", ARXIV_CATEGORIES),
+        ("arxiv_keywords", ARXIV_KEYWORDS),
+        ("github_queries", GITHUB_QUERIES),
+    ):
+        value = profile.get(key)
+        if isinstance(value, list) and value:
+            cleaned = tuple(str(v).strip() for v in value if str(v).strip())
+            if cleaned:
+                globals()[key.upper()] = cleaned
+                applied.append(key)
+
+    minutes = profile.get("daily_minutes")
+    if isinstance(minutes, int) and 10 <= minutes <= 240:
+        DAILY_MINUTES = minutes
+        applied.append("daily_minutes")
+
+    return applied
+
 
 # 全文喂给模型时的字符上限。超了就截断——截断这件事会同时告诉
 # 用户（界面上）和模型（提示词里），不能悄悄截。

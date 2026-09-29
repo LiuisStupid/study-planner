@@ -1,6 +1,7 @@
 """每日学习计划推荐器：端到端 / RL / VLA 方向的课程表 + 进度追踪。"""
 from __future__ import annotations
 
+from . import config
 from .config import load_env_file
 
 __version__ = "0.1.0"
@@ -17,3 +18,8 @@ __version__ = "0.1.0"
 # app.py / cli.py 里恰好也能用，只是因为它们把 config 写在了 fromlist 的第一位——
 # 谁把那行的顺序调一下就会静默失效。放在包的 __init__ 里则和导入顺序无关。
 load_env_file()
+
+# 读 data/profile.json，把用户画像里的抓取口味和每日预算覆盖到 config 的常量上。
+# 和上面同一个位置、同一个理由：晚了就有模块已经把旧值读走了。
+# 没有画像文件时是个 no-op，保持内置口味。
+config.load_profile()

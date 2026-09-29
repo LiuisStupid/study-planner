@@ -8,11 +8,18 @@ __pycache__/
 venv/
 
 # 运行时数据。这些是本机状态，不入库：
-#   data/state.json     学习进度、连续天数、复习队列
-#   data/cache/         arXiv / GitHub 抓取缓存、已解析的论文正文
-#   data/dead_links.txt check-links 的产物
-# 换台机器重新积累即可，不需要跟着代码走。
+#   data/state.json      学习进度、连续天数、复习队列
+#   data/profile.json    你的画像（想做哪个方向、每天多少分钟）
+#   data/curriculum.json 按画像生成的课程表
+#   data/cache/          arXiv / GitHub 抓取缓存、已解析的论文正文
+#   data/backups/        cli.py import 覆盖之前的自动备份
+#   data/dead_links.txt  check-links 的产物
+# 换台机器就用 `python cli.py export` 打包带走，不要靠 git。
 data/
+
+# 进度导出包。默认落在 ~/study-planner-backup/，但万一有人把它导进仓库
+# （要 --force 才行），这条兜底——这个仓库是公开的，进度是个人数据。
+/study-planner-*.json
 
 # 本机凭据。**必须忽略**：这个文件里是 API key，提交上去就等于泄露。
 # 配置脚本 .claude/skills/study-planner-setup/scripts/onboard.py 会写它，权限 600。

@@ -1,4 +1,4 @@
-"""课程表：端到端自动驾驶 / RL / VLA 三个方向的分层精选资源。
+"""课程表。默认是内置的那份：端到端自动驾驶 / RL / VLA 三个方向的分层精选资源。
 
 这是整个工具的核心数据。设计要点：
 
@@ -12,6 +12,20 @@
 
 权重设计：主线是 RL × VLA 交叉点（`rl_x_vla` 权重最高），但不让基础饿死
 （`rl_core` / `diffusion` 权重也不低），工程基建权重最低——它是随时能补的。
+
+---
+
+## 课程表也可以是用户自己的
+
+下面这份是**内置默认值**。如果 `<data>/curriculum.json` 存在（由
+`cli.py profile --regenerate` 按用户画像生成，或用户手写），就用那一份，
+`CURRICULUM_SOURCE` 会说明这次进程用的是哪个。
+
+**为什么必须在 import 期读文件，而不是提供一个 `reload()`：**
+planner / paper / render / llm_plan / app / cli 六个模块写的都是
+`from .knowledge import ITEM_BY_ID, ITEMS, TRACK_BY_ID` —— 这是**直接绑定**。
+模块加载完之后再换值，那六个模块手里的名字依然指向旧对象，而且**不会有任何报错**，
+只是安静地用着错的课程表。所以只能在这里一次定下来。
 """
 from __future__ import annotations
 
@@ -45,9 +59,9 @@ class Item:
 
 
 # ---------------------------------------------------------------------------
-# 六个方向
+# 六个方向（内置默认值）
 # ---------------------------------------------------------------------------
-TRACKS: tuple[Track, ...] = (
+_BUILTIN_TRACKS: tuple[Track, ...] = (
     Track(
         "rl_core", "RL 基础", 3,
         "补到「能读懂论文」为止，不追求理论完备。你的 PPO 已经能跑，缺的是记号背后的直觉。",
@@ -74,12 +88,17 @@ TRACKS: tuple[Track, ...] = (
     ),
 )
 
-TRACK_BY_ID: dict[str, Track] = {t.id: t for t in TRACKS}
-
 # ---------------------------------------------------------------------------
-# 课程表
+# 课程表（内置默认值）
+#
+# ⚠️ 注意这里**没有** TRACK_BY_ID —— 它被挪到文件末尾去了。
+# 原来它就在这个位置（TRACKS 和 ITEMS 之间）。加"从文件读课程表"之后那个位置是错的：
+# 它会用**内置**的 tracks 构建，而 ITEMS 可能来自用户文件，于是每个条目都查不到自己的
+# track，planner._candidates 里 `if it.track not in TRACK_BY_ID: continue` 把它们全部
+# 过滤掉，用户看到的是「已解锁的条目都做完了」，**而且没有任何报错**。
+# TRACK_BY_ID 和 ITEM_BY_ID 都必须在下面的 _resolve_curriculum() 之后。
 # ---------------------------------------------------------------------------
-ITEMS: tuple[Item, ...] = (
+_BUILTIN_ITEMS: tuple[Item, ...] = (
     # ======================= rl_core：RL 基础 =======================
     Item(
         "rl-spinningup", "Spinning Up：PPO 的实现拆解", "rl_core", "doc",
@@ -554,36 +573,41 @@ ITEMS: tuple[Item, ...] = (
     ),
 )
 
-ITEM_BY_ID: dict[str, Item] = {it.id: it for it in ITEMS}
+# ---------------------------------------------------------------------------
+# 校验
+#
+# ⚠️ 这个函数**必须定义在 _resolve_curriculum() 之前**。
+# 它要被 curriculum.load_file() → validate() 调用，而那条路径是
+# _resolve_curriculum() 在模块执行期间触发的——那时候模块只跑到一半，
+# 定义在下方的名字还不存在。实测过：放下面会得到
+#     cannot import name 'check_items' from partially initialized module
+# 而它表现为「静默退回内置课程表」，不仔细看还以为文件没写对。
+# ---------------------------------------------------------------------------
+def check_items(tracks, items) -> list[str]:
+    """对**任意一组** tracks/items 做一致性自检，返回问题列表（空 = 没问题）。
 
+    检查四件事：重复 id、track 是否存在、prereq 指向的 id 是否存在、有没有成环，
+    以及**是否可达**。
 
-def items_of(track: str) -> tuple[Item, ...]:
-    """取某条 track 下的全部条目，按 level 从基础到进阶排序。"""
-    order = {"foundation": 0, "intermediate": 1, "advanced": 2}
-    return tuple(sorted(
-        (it for it in ITEMS if it.track == track),
-        key=lambda it: (order.get(it.level, 9), it.id),
-    ))
-
-
-def check_consistency() -> list[str]:
-    """自检课程表的内部一致性，返回问题列表（空列表 = 没问题）。
-
-    检查三件事：track 是否存在、prereq 指向的 id 是否存在、有没有重复 id。
+    抽成带参数的函数（而不是只查模块级那两份数据）是为了让
+    `cli.py profile --regenerate` 能在**写盘之前**用同一套规则验一遍 AI 生成的课程表。
+    两处各写一份检查逻辑，迟早有一边漏掉新加的规则。
     """
     problems: list[str] = []
     seen: set[str] = set()
+    item_by_id = {it.id: it for it in items}
+    track_by_id = {t.id: t for t in tracks}
 
-    for it in ITEMS:
+    for it in items:
         if it.id in seen:
             problems.append(f"重复的 item id：{it.id}")
         seen.add(it.id)
 
-        if it.track not in TRACK_BY_ID:
+        if it.track not in track_by_id:
             problems.append(f"{it.id} 的 track 不存在：{it.track}")
 
         for pre in it.prereq:
-            if pre not in ITEM_BY_ID:
+            if pre not in item_by_id:
                 problems.append(f"{it.id} 的前置 {pre} 不存在")
 
     # 有向图成环检查（课程表成环会导致永远解锁不了）
@@ -596,12 +620,106 @@ def check_consistency() -> list[str]:
         if state.get(node) == 2:
             return
         state[node] = 1
-        for pre in ITEM_BY_ID[node].prereq:
-            if pre in ITEM_BY_ID:
+        for pre in item_by_id[node].prereq:
+            if pre in item_by_id:
                 visit(pre, path + [node])
         state[node] = 2
 
-    for it in ITEMS:
+    for it in items:
         visit(it.id, [])
 
+    # 可达性。成环和悬空前置都查不出「孤岛」：一簇条目前置互相引用、谁也没有
+    # 空前置——它一致、无环、**永远解锁不了**。planner 只会推荐 prereq 全完成的条目，
+    # 所以这种簇在页面上表现为"凭空消失"，比报错更难查。
+    # 从零前置的入口正向 BFS，走不到的就是孤岛。
+    children: dict[str, list[str]] = {}
+    for it in items:
+        for pre in it.prereq:
+            children.setdefault(pre, []).append(it.id)
+
+    reachable: set[str] = set()
+    stack = [it.id for it in items if not it.prereq]
+    while stack:
+        node = stack.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        stack.extend(children.get(node, ()))
+
+    for it in items:
+        if it.id not in reachable:
+            problems.append(
+                f"{it.id} 永远解锁不了：从任何「无前置」的入口沿 prereq 都走不到它"
+            )
+
     return problems
+
+
+# ---------------------------------------------------------------------------
+# 决定这次进程用哪份课程表
+# ---------------------------------------------------------------------------
+def _resolve_curriculum():
+    """返回 (tracks, items, 来源, 错误)。**绝不抛异常。**
+
+    读不到 / 读坏了 / 校验不过，一律退回内置，并把原因放进错误串——
+    静默退回内置和"我生成的课程表不见了"是同一种体验，用户分不出来。
+
+    两个导入刻意放在函数里而不是模块顶层：
+    - `config`：本模块顶上那句「只 import dataclasses」被 reference.md 引用着，
+      顶层导入会让那句话变成假的。
+    - `curriculum`：它在顶层 `from .knowledge import Track, Item`，
+      本模块顶层再 import 它就是一个环。方向只能是单向的。
+    """
+    # 整个函数体都在 try 里。这条边界比看起来重要：本函数的返回值直接决定
+    # ITEMS/TRACK_BY_ID 是什么，它一旦抛异常，连 `import app` 都会失败，
+    # 面板和 CLI 一起打不开。宁可退回内置也不能让整包 import 挂掉。
+    # （实测踩过：config 少一个属性就在这一行炸了。）
+    try:
+        import os
+        from pathlib import Path
+
+        from . import config
+
+        forced = os.environ.get("STUDY_PLANNER_CURRICULUM", "").strip()
+        if forced == "builtin":
+            return _BUILTIN_TRACKS, _BUILTIN_ITEMS, "builtin", ""
+
+        path = Path(forced) if forced else config.CURRICULUM_PATH
+        if not path.exists():
+            return _BUILTIN_TRACKS, _BUILTIN_ITEMS, "builtin", ""
+
+        from . import curriculum as curriculum_mod
+
+        tracks, items, err = curriculum_mod.load_file(path)
+        if err or not items:
+            return _BUILTIN_TRACKS, _BUILTIN_ITEMS, "builtin", err or "课程表是空的"
+
+        return tuple(tracks), tuple(items), str(path), ""
+    except Exception as e:
+        return _BUILTIN_TRACKS, _BUILTIN_ITEMS, "builtin", f"读课程表失败：{e}"
+
+
+TRACKS, ITEMS, CURRICULUM_SOURCE, CURRICULUM_ERROR = _resolve_curriculum()
+
+# ↓↓ 这两个必须在 _resolve_curriculum() 之后，理由见上面 ITEMS 那段注释 ↓↓
+TRACK_BY_ID: dict[str, Track] = {t.id: t for t in TRACKS}
+ITEM_BY_ID: dict[str, Item] = {it.id: it for it in ITEMS}
+
+if CURRICULUM_ERROR:
+    import sys as _sys
+
+    print(f"[knowledge] 用户课程表不可用，已退回内置：{CURRICULUM_ERROR}", file=_sys.stderr)
+
+
+def items_of(track: str) -> tuple[Item, ...]:
+    """取某条 track 下的全部条目，按 level 从基础到进阶排序。"""
+    order = {"foundation": 0, "intermediate": 1, "advanced": 2}
+    return tuple(sorted(
+        (it for it in ITEMS if it.track == track),
+        key=lambda it: (order.get(it.level, 9), it.id),
+    ))
+
+
+def check_consistency() -> list[str]:
+    """自检**当前生效的**课程表。CLI 的 `check` 和启动时的兜底用这个。"""
+    return check_items(TRACKS, ITEMS)

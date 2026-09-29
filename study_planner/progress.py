@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from typing import Optional
@@ -15,6 +16,24 @@ from . import config
 STATUS_TODO = "todo"        # 还没做（默认）
 STATUS_DONE = "done"        # 已完成
 STATUS_SKIPPED = "skipped"  # 主动跳过，不再推荐
+
+
+def _quarantine(path, err: Exception) -> None:
+    """把读不动的状态文件改名留档，然后让调用方当空进度继续。
+
+    改名而不是删除：用户可能想自己翻一翻那份文件。失败也绝不抛异常——
+    状态文件坏了不该让面板打不开，那正是这个函数存在的理由。
+    """
+    target = path.with_name(path.name + ".corrupt")
+    try:
+        if target.exists():
+            # 已经留过一份了（比如连续两次启动都读到坏文件），别把上一份覆盖掉
+            target = target.with_name(f"{target.name}.{int(path.stat().st_mtime)}")
+        path.rename(target)
+        print(f"[progress] 状态文件读不动（{type(err).__name__}），已留档到 {target}，"
+              f"本次按空进度启动。", file=sys.stderr)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -33,9 +52,31 @@ class ItemState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ItemState":
-        # 过滤掉不认识的键，方便以后加字段时不炸老状态文件
+        """坏条目降级成默认值，**绝不抛异常**。
+
+        两条防线，针对的是不同的人：
+        - 过滤不认识的键：以后加字段时不炸老状态文件（自己人改的）
+        - 逐字段校验类型：用户手改 state.json 改坏了也不炸（外人改的）
+        第二种情况原来会漏：`items` 里某个值是字符串的话，`d.items()` 直接
+        AttributeError 逃出去，面板整个打不开。
+        """
+        if not isinstance(d, dict):
+            return cls()
+
         known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
-        return cls(**known)
+        st = cls(**known)
+
+        if st.status not in (STATUS_TODO, STATUS_DONE, STATUS_SKIPPED):
+            st.status = STATUS_TODO
+        if not isinstance(st.shaky, bool):
+            # 特别提防 "false" 这种字符串：它是真值，会让条目莫名其妙进复习队列
+            st.shaky = False
+        for f in ("first_seen", "last_seen", "done_at"):
+            if getattr(st, f) is not None and not isinstance(getattr(st, f), str):
+                setattr(st, f, None)
+        if not isinstance(st.notes, str):
+            st.notes = ""
+        return st
 
 
 @dataclass
@@ -112,7 +153,10 @@ class Progress:
                 continue
             try:
                 last = date.fromisoformat(st.last_seen)
-            except ValueError:
+            except (ValueError, TypeError):
+                # TypeError 不是多余的：fromisoformat 传进非字符串（比如手改出来的
+                # 数字 20260926）抛的是 TypeError，只写 ValueError 抓不住。
+                # ItemState.from_dict 现在会挡掉这种值，这里是第二道。
                 out.append(item_id)
                 continue
             if (day - last).days >= config.REVIEW_AFTER_DAYS:
@@ -122,17 +166,45 @@ class Progress:
     # ---------------- 统计 ----------------
 
     def done_count(self, track: Optional[str] = None) -> int:
-        """完成数。给定 track 就只数那条 track 的。"""
-        if track is None:
-            return sum(1 for st in self.items.values() if st.status == STATUS_DONE)
+        """完成数，**只数当前课程表里还存在的条目**。
 
+        为什么必须限定：`items` 是按 id 扁平存的，换过课程表之后会留下"野 id"。
+        不限定的话它们照样被数进去，于是页面上会出现「5/4」这种分子大于分母的数字
+        ——分母是 `len(ITEMS)`，分子却包含已经不在课程表里的条目。
+        """
         from .knowledge import ITEM_BY_ID
+
+        if track is None:
+            return sum(
+                1 for item_id, st in self.items.items()
+                if st.status == STATUS_DONE and item_id in ITEM_BY_ID
+            )
 
         return sum(
             1 for item_id, st in self.items.items()
             if st.status == STATUS_DONE
             and item_id in ITEM_BY_ID
             and ITEM_BY_ID[item_id].track == track
+        )
+
+    def stale_ids(self) -> list[str]:
+        """还在状态文件里、但已不在当前课程表中的 id。
+
+        换过课程表就会有。它们**故意留着不删**：用户换回原来的课程表时，
+        那些完成记录应该回来。但所有统计和渲染都要忽略它们，并且要**说出来**
+        ——默默把差异藏掉，用户只会觉得数字对不上。
+        """
+        from .knowledge import ITEM_BY_ID
+
+        return sorted(i for i in self.items if i not in ITEM_BY_ID)
+
+    def stale_done_count(self) -> int:
+        """其中已经标记为完成的条数，显示「另有 N 条」时用。"""
+        from .knowledge import ITEM_BY_ID
+
+        return sum(
+            1 for i, st in self.items.items()
+            if i not in ITEM_BY_ID and st.status == STATUS_DONE
         )
 
     def track_stats(self) -> dict[str, dict[str, int]]:
@@ -159,7 +231,14 @@ class Progress:
 
     def current_streak(self, today: date) -> int:
         """当前连续学习天数。今天还没完成不算断——从昨天往前数。"""
-        days = {date.fromisoformat(d) for d in self.active_days()}
+        days = set()
+        for d in self.active_days():
+            try:
+                days.add(date.fromisoformat(d))
+            except (ValueError, TypeError):
+                # 手改出来的 done_at（"昨天"、20260926）不该让整个首页崩掉。
+                # from_dict 会挡掉非字符串，但挡不住"是字符串但不是日期"。
+                continue
         if not days:
             return 0
 
@@ -186,7 +265,8 @@ class Progress:
         }
         self.history = [h for h in self.history if h.get("date") != iso]
         self.history.append(entry)
-        self.history.sort(key=lambda h: h.get("date", ""))
+        # str() 是必需的：手改出来的 date 要是数字，和字符串混在排序里会抛 TypeError
+        self.history.sort(key=lambda h: str(h.get("date") or ""))
         # 历史只留最近 180 天，避免文件无限膨胀
         self.history = self.history[-180:]
 
@@ -204,22 +284,49 @@ class Progress:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Progress":
+        """容忍手改坏的文件：根不是对象、items 不是对象、history 不是数组，
+        一律降级成默认值而不是抛异常。"""
+        if not isinstance(d, dict):
+            return cls()
+
+        raw_items = d.get("items")
+        items = (
+            {k: ItemState.from_dict(v) for k, v in raw_items.items()
+             if isinstance(k, str)}
+            if isinstance(raw_items, dict) else {}
+        )
+
+        raw_hist = d.get("history")
+        history = [h for h in raw_hist if isinstance(h, dict)] if isinstance(raw_hist, list) else []
+
+        version = d.get("version")
+        streak = d.get("longest_streak")
+
         return cls(
-            version=d.get("version", 1),
-            items={k: ItemState.from_dict(v) for k, v in (d.get("items") or {}).items()},
-            history=d.get("history") or [],
-            longest_streak=d.get("longest_streak", 0),
+            version=version if isinstance(version, int) else 1,
+            items=items,
+            history=history,
+            longest_streak=streak if isinstance(streak, int) and streak >= 0 else 0,
         )
 
     @classmethod
     def load(cls) -> "Progress":
-        """读状态文件。不存在或坏了都返回空进度，绝不抛异常——面板不能因此打不开。"""
+        """读状态文件。不存在或坏了都返回空进度，绝不抛异常——面板不能因此打不开。
+
+        **坏文件改名留档，不就地覆盖。** 原来只是返回空 `Progress`，可后面任何一次
+        标记都会 `save()`，把那个可能还能救的文件用一份空数据盖掉——不可逆。
+        用户手上这份进度可能是他唯一的一份。
+        """
         path = config.STATE_PATH
         if not path.exists():
             return cls()
         try:
             return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            # TypeError / AttributeError 是给类型不对的 JSON 留的：
+            # json 语法错误是 ValueError，但 `"items": []` 这种合法 JSON
+            # 会一路走到 `.items()` 上抛 AttributeError。
+            _quarantine(path, e)
             return cls()
 
     def save(self) -> None:

@@ -1,9 +1,14 @@
 # 📚 每日学习计划推荐器
 
-给**端到端自动驾驶 / 强化学习 / VLA** 三个方向排每天的学习计划。
+给一个学习方向排每天的计划：每天 1 篇精读 + 1 个小任务 + 到期的复习，
+配一个可以读论文、划词问 AI 的本地面板。
 
-解决的问题不是「不知道学什么」，而是**没有稳定的每日节奏**：这三个方向的论文
+解决的问题不是「不知道学什么」，而是**没有稳定的每日节奏**：这几个方向的论文
 半衰期只有 3–12 个月，靠临时想起来去 arXiv 翻，容易变成追热点而没有主线。
+
+> **方向是自己的。** 仓库里内置的那份课程表是个示例（端到端自动驾驶 / RL / VLA），
+> 你可以在 Claude Code 里说一句「我想学 XX」，它会按你的画像生成一份新的。
+> 见下面的「[换个方向](#换个方向)」。
 
 ## 🚀 怎么开始
 
@@ -80,6 +85,67 @@ chmod 600 .env
 （不会每次刷新都换一批让你无所适从），换天才变化。打散用的是 `hashlib` 而不是内置
 `hash()`——后者按进程加盐，跨进程不稳定。
 
+## 换个方向
+
+内置的课程表是个**示例**（端到端自动驾驶 / RL / VLA）。换成你自己的：
+
+**用 Claude Code（推荐）**：在仓库里说「我想学量子计算纠错，写过 Qiskit，目标是能复现解码器」，
+它会把答案拼成命令跑掉。**「想学什么」不是秘密，可以直接在对话里说**——
+这和 API key 不一样，key 只能在你自己的终端里输。
+
+**手动**：
+
+```bash
+.venv/bin/python cli.py profile \
+  --topics "量子计算与纠错" \
+  --level "有量子力学基础，写过 Qiskit，没做过纠错" \
+  --goal "能读懂表面码论文并跑通解码器复现" \
+  --minutes 60 \
+  --regenerate
+```
+
+`--regenerate` 会调一次模型，生成 3–5 个方向、10–30 个条目，然后：
+
+1. **结构校验**（必须过，不过不写盘）：id 唯一、前置存在、**无环**、
+   每条都解锁得到、repo/doc 至少 6 条（不然「小任务」那个槽会天天空着）
+2. **arXiv 抽查**：一次请求问清所有编号是否真实存在。
+   ⚠️ 这一步**不拦写盘**——网络抖动和编造编号在这里长得一样，
+   用网络结果否决一份结构完好的课程表会让人在不存在的问题上反复重试
+3. 写入 `data/curriculum.json`，并重启面板后生效
+
+生成的课程表是 AI 写的，**建议自己过一眼**，尤其是标题和链接。
+之后想手动改就直接编辑 `data/curriculum.json`，格式和内字段自解释。
+
+```bash
+.venv/bin/python cli.py profile              # 看当前画像
+.venv/bin/python cli.py profile --reset      # 删掉生成的，回到内置那份
+.venv/bin/python cli.py check                # 校验当前课程表（含成环/孤立检查）
+```
+
+> ⚠️ 换课程表之后，你原来进度里那些**不在新课程表里的条目会保留在状态文件里**，
+> 但不再计入进度——换回旧课程表它们就回来了。`cli.py status` 和面板都会
+> 「另有 N 条…」地说明这件事，不会闷声把数字改掉。
+
+## 备份 / 换机器
+
+`data/` 是 gitignore 的，所以**重新 clone 一次进度就没了**。要带走就用：
+
+```bash
+.venv/bin/python cli.py export               # 默认 ~/study-planner-backup/study-planner-日期.json
+.venv/bin/python cli.py import <包> --dry-run  # 只看会发生什么，不写
+.venv/bin/python cli.py import <包>            # 恢复（有 TTY 会问一次确认）
+```
+
+包里装**三样**：进度、画像、生成的课程表。课程表必须装——新机器上没有它，
+只恢复进度会得到一堆指向不存在条目的完成记录。
+
+- **包里不含任何凭据**（有测试保证）。凭据在 `.env` 里，那个不入库也不进包。
+- 默认路径在**仓库外面**（`~/study-planner-backup/`）。`data/` 正是重新 clone
+  会消失的东西，备份放那儿等于没备份。
+- 往仓库里导会被拒绝——这个仓库是公开的，进度和画像是个人数据。
+- 导入前会自动把现有文件备份到 `data/backups/<时间戳>/`。
+- **导入后必须重启面板**：课程表是进程启动时读的。
+
 ## 命令行
 
 ```bash
@@ -89,8 +155,11 @@ python cli.py done <id>      # 标记完成
 python cli.py skip <id>      # 跳过，不再推荐
 python cli.py shaky <id>     # 标记「没读懂」，3 天后重新推
 python cli.py status         # 看整体进度
-python cli.py check          # 课程表自检（依赖成环 / id 重复）
+python cli.py check          # 课程表自检（成环 / 重复 id / 悬空前置 / 跑不到的孤岛）
 python cli.py check-links    # 逐个校验课程表里的 URL 还能不能打开
+python cli.py profile        # 看/改画像；--regenerate 按画像生成课程表
+python cli.py export [路径]   # 打包进度+画像+课程表（换机器用）
+python cli.py import <路径>   # 从包里恢复（--dry-run 只看不动）
 python cli.py restart        # 重启网页面板（自动停掉旧的，再前台启动）
 ```
 
@@ -366,15 +435,20 @@ study-planner/              # ← 项目根目录
 │   ├── SKILL.md            #   给 AI 看的流程
 │   ├── reference.md        #   按需查的详细参考
 │   └── scripts/onboard.py  #   体检 / 建环境 / 交互式配凭据（只用标准库）
-├── data/
-│   ├── state.json          # 进度状态（CLI 和面板共用的唯一数据源）
+├── data/                   # 全部本机状态，不入库；换机器用 `cli.py export`
+│   ├── state.json          # 进度（CLI 和面板共用的唯一数据源）
+│   ├── profile.json        # 你的画像：想做哪个方向、每天多少分钟
+│   ├── curriculum.json     # 按画像生成的课程表（没有就用内置那份）
+│   ├── backups/            # import 覆盖之前的自动备份
 │   ├── cache/              # arXiv / GitHub 当日缓存
 │   │   └── docs/           # 论文正文缓存（长期有效）
 │   │       └── pages/      #   左栏 iframe 用的代理页面（改 proxy.py 后删掉可重生成）
 │   └── dead_links.txt      # check-links 的产物
 └── study_planner/
     ├── config.py           # 路径常量 + 可调参数（每日时长、抓取条数等）
-    ├── knowledge.py        # ★ 课程表
+    ├── knowledge.py        # ★ 内置课程表 + 从文件解析 + 一致性校验
+    ├── curriculum.py       # ★ 用户课程表的格式、解析、校验、原子写
+    ├── bundle.py           # ★ 导出/导入打包（换机器用）
     ├── progress.py         # 状态模型 + JSON 读写 + 连续天数
     ├── sources.py          # arXiv / GitHub 抓取（只用标准库）
     ├── planner.py          # 选片引擎
@@ -398,6 +472,9 @@ study-planner/              # ← 项目根目录
 | `FULLTEXT_MAX_CHARS` | 60000 | 喂给模型的正文上限，超了截断并告知 |
 | `QUOTE_MAX_CHARS` | 4000 | 一次划词最多引用多少字，超了截断并告知 |
 | `DASHBOARD_PORT` | 8766 | 面板端口 |
+
+⚠️ 有画像时，`ARXIV_KEYWORDS` / `GITHUB_QUERIES` / `ARXIV_CATEGORIES` / `DAILY_MINUTES`
+会被 `data/profile.json` 覆盖（空的列表不覆盖）。改这两处之前先确认画像里有没有。
 
 论文正文缓存在 `data/cache/docs/`，内容不会变所以长期有效（不同于按天过期的
 抓取缓存）。想强制重抓就删掉这个目录；只重抓左栏的代理页面就删 `docs/pages/`，

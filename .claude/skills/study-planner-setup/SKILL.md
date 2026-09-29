@@ -23,6 +23,10 @@ description: 帮新克隆 study-planner 仓库的人搞清这个仓库是干什�
 key 一旦出现在对话里，就会被**发送给模型提供方**并写进会话记录文件。
 `scripts/onboard.py` 已经设计成"用户在自己的终端里用 `getpass` 输"——把命令交给他就行。
 
+> **⚠️ 这条只管密钥，不管别的信息。** 「你想学什么方向」**不是**秘密，
+> 直接在对话里问就行，而且**应该**问——第三步要靠它生成课程表。
+> 把这条铁律扩大成"什么都不能问"，会让整个流程走不下去。
+
 **2. 绝不运行 `cli.py restart` 或 `cli.py today`。**
 `restart` 会杀掉用户**正在使用**的面板进程（先 `lsof -ti tcp:8766` 看一眼，只报告不 kill）；
 `today` 会调 `prog.record_day()` + `save()`，覆写 `data/state.json` 里当天的记录。
@@ -35,7 +39,7 @@ Claude Code 会把**它自己那份** `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_U
 `onboard.py` 只认**持久化来源**（`.env` 文件 或 `~/.claude/settings.json` 的 `env` 块），
 直接用它，不要自己写探测。
 
-## 三步走
+## 四步走
 
 **第一步：体检 —— 它同时验证 key 能不能真的用。**
 
@@ -44,12 +48,12 @@ python3 .claude/skills/study-planner-setup/scripts/onboard.py --check
 ```
 
 只读，不改任何东西，但**会真发一次最小请求验证凭据**（最长等 20 秒）。
-这一步就够了：**只要退出码是 `0`，直接跳到第三步启动，不要进第二步。**
+这一步就够了：**只要退出码是 `0`，直接跳到第四步启动，不要进第二步。**
 用户如果本来就配好了、能跑通，就完全不该看到"配置凭据"这一步。
 
 | 退出码 | 含义 | 下一步 |
 |---|---|---|
-| `0` | 环境齐 + 凭据**验证通过** | **直接进第三步**，不要再提配置凭据 |
+| `0` | 环境齐 + 凭据**验证通过** | **直接进第四步**，不要再提配置凭据 |
 | `1` | 环境坏了（缺 venv 或依赖） | 跑下面的 `--install` |
 | `2` | 需要交互式终端 | 把输出里的命令原样交给用户 |
 | `3` | 没有凭据，或 key 被端点拒绝 | 进第二步 |
@@ -81,7 +85,36 @@ python3 .claude/skills/study-planner-setup/scripts/onboard.py --install
 > 脚本会当场发一次最小请求验证 key，然后把配置写进 `.env`（权限 600，已被 gitignore）。
 > 不要在这个对话里粘贴 key —— 那会被发送给模型提供方并留在记录里。
 
-**第三步：启动。** 环境齐、凭据也验过了，**由用户**执行：
+**第三步：问方向，按画像生成课程表（可选，但强烈建议做）。**
+
+仓库内置的课程表是一份**示例**（端到端自动驾驶 / RL / VLA）。如果用户不是做这个的，
+现在就该问清楚——**直接在对话里问，这不是秘密**：
+
+> 你主要想学什么方向？现在的基础是什么？想达到什么目标？每天大概能投入多少分钟？
+
+拿到答案后拼成一条命令跑（**先告诉他这一下会花他的 API 额度**）：
+
+```bash
+.venv/bin/python cli.py profile \
+  --topics "量子计算与纠错" \
+  --level "有量子力学基础，写过 Qiskit，没做过纠错" \
+  --goal "能读懂表面码论文并跑通解码器复现" \
+  --minutes 60 \
+  --regenerate
+```
+
+它会：结构校验（成环 / 孤立 / 小任务槽够不够）→ arXiv 抽查编号真假 → 写
+`data/curriculum.json`。**失败了不会写任何文件**，原来的课程表原封不动。
+
+几点要注意：
+
+- **跳过是合法结局。** 用户说"就用内置的"或者不想花额度，就直接进第四步，
+  内置课程表照样能用。不要把它说成必须做的事。
+- 报错时把 `cli.py profile` 的原话念给他，别自己改写。
+- 生成完提醒他：**这份课程表是 AI 写的，建议自己过一眼**，尤其是链接。
+- 用户已经有画像/课程表时（`--check` 会报），别自作主张重新生成。
+
+**第四步：启动。** 环境齐、凭据也验过了，**由用户**执行：
 
 ```bash
 .venv/bin/python cli.py restart     # http://127.0.0.1:8766
@@ -99,7 +132,9 @@ python3 .claude/skills/study-planner-setup/scripts/onboard.py --install
 | `python cli.py shaky <id>` | 标记「没读懂」，3 天后重推 |
 | `python cli.py status` | 总体进度 + 连续天数 |
 | `python cli.py restart` | 起/重启网页面板（8766） |
-| `python cli.py check` | 课程表自检（依赖成环 / id 重复） |
+| `python cli.py check` | 课程表自检（成环 / 重复 id / 孤立条目） |
+| `python cli.py profile` | 看/改画像，`--regenerate` 生成自己的课程表 |
+| `python cli.py export` | 打包进度+画像+课程表（换机器用） |
 
 面板里 `/read/<id>` 是**论文阅读器**：左边原文，右边问 AI。
 **用鼠标选中左边任意一段会浮出「问 AI」**，点一下就能就着那段话提问。
@@ -128,3 +163,6 @@ AI 功能（每日点评 + 阅读器问答）是可选的——没配凭据也�
 - 不要直接编辑 `.env`，交给 `onboard.py`，它会保留文件里的其它内容（比如 `GITHUB_TOKEN`）。
 - 不要在输出里回显 key 的任何完整形式。
 - 不要在用户没要求时跑 `pip install`——`--check` 说没问题就别动。
+- **不要跑 `cli.py import`**：它会覆盖用户现有的进度。要导入让他自己来。
+- **不要在没告诉用户会花额度的情况下跑 `cli.py profile --regenerate`**。
+- 也不要自己编辑 `data/curriculum.json` 或 `data/profile.json`——走 `cli.py profile`。

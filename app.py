@@ -124,14 +124,37 @@ _LAYOUT = """<!doctype html>
 <main>
 {% block body %}{% endblock %}
 </main>
-<div class="foot">所有数据只存在你电脑上 · 课程表在 study_planner/knowledge.py</div>
+<div class="foot">所有数据只存在你电脑上 · __CURRICULUM_LINE__</div>
 </body>
 </html>
 """
 
 
+def _curriculum_line() -> str:
+    """页脚那句「课程表来自哪」。
+
+    必须说出来：生成过课程表的人如果看到的是内置那份，唯一能察觉的地方就是这里。
+    静默退回内置 = 用户以为自己的课程表丢了，却不知道去哪找原因。
+    """
+    src = knowledge.CURRICULUM_SOURCE
+    if knowledge.CURRICULUM_ERROR:
+        return f'⚠️ <span style="color:#c9862b">课程表读不了，退回内置：{_esc(knowledge.CURRICULUM_ERROR)}</span>'
+    if src == "builtin":
+        return "课程表：内置示例（端到端自动驾驶 / RL / VLA）· 换成你自己的：python cli.py profile"
+    return f"课程表来自 {_esc(src)}"
+
+
+def _stale_note(prog) -> str:
+    """「另有 N 条已完成的不在当前课程表里」。换过课程表才会有。"""
+    n = prog.stale_done_count()
+    if not n:
+        return ""
+    return f'<span class="meta">（另有 {n} 条已完成的不在当前课程表里，不计入）</span>'
+
+
 def _page(body: str) -> str:
-    return _LAYOUT.replace("{% block body %}{% endblock %}", body)
+    return _LAYOUT.replace("{% block body %}{% endblock %}", body).replace(
+        "__CURRICULUM_LINE__", _curriculum_line())
 
 
 def _esc(s: str) -> str:
@@ -366,7 +389,7 @@ def progress_page():
           <p style="font-size:24px;margin:6px 0;color:var(--accent-dark)">
             {prog.current_streak(today)} 天</p>
           <div class="meta">历史最长 {prog.longest_streak} 天 ·
-            总完成 {prog.done_count()}/{len(ITEMS)}</div>
+            总完成 {prog.done_count()}/{len(ITEMS)} {_stale_note(prog)}</div>
         </div>
       </div>
       <div>

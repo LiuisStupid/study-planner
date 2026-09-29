@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,10 +59,71 @@ def _warn(msg: str) -> None:
     print(f"[sources] {msg}", file=sys.stderr)
 
 
+def verify_arxiv_ids(ids) -> dict:
+    """一次问清一批 arXiv 编号是否真实存在，返回 {id: 真实标题 or None}。
+
+    **一次请求，不是每条一个。** arXiv 的 API 支持 `id_list=a,b,c`，
+    把 30 个编号拆成 30 个请求既慢又容易触发限流。
+
+    用途：AI 生成课程表之后抽查它有没有编造编号。这个仓库被假 arXiv id
+    坑过一次（46 个 id 逐个核对过真实标题），所以这一步值得做。
+
+    ⚠️ `max_results` 必须显式给大值：arXiv API 默认只返回 **10** 条，
+    漏了它会把后面 20 篇真实存在的论文全报成"编的"——一个很难看的假阳性。
+
+    **只能回答「这个编号解析得出来吗」，不能核对标题对不对**：本工具里的标题是
+    中文，arXiv 返回的是英文。所以真实标题也一并返回，让人自己去核。
+
+    整批失败（网络）时返回**空 dict**，调用方据此区分「查不到」和「没查成」。
+    """
+    ids = [i for i in dict.fromkeys(ids) if i]      # 去重且保序
+    if not ids:
+        return {}
+
+    url = ("https://export.arxiv.org/api/query?id_list=" + ",".join(ids)
+           + f"&max_results={max(len(ids), 10)}")
+    raw = _get(url)
+    if raw is None:
+        return {}
+
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return {}
+
+    found: dict = {i: None for i in ids}
+    for entry in root.findall("a:entry", ATOM_NS):
+        id_el = entry.find("a:id", ATOM_NS)
+        title_el = entry.find("a:title", ATOM_NS)
+        if id_el is None or not id_el.text:
+            continue
+        # <id> 形如 http://arxiv.org/abs/2406.09246v3，去掉版本号再比对
+        m = re.search(r"(\d{4}\.\d{4,5})", id_el.text)
+        if not m or m.group(1) not in found:
+            continue
+        title = (title_el.text or "") if title_el is not None else ""
+        found[m.group(1)] = re.sub(r"\s+", " ", title).strip()
+
+    return found
+
+
 # ---------------------------------------------------------------------------
 # 缓存
 # ---------------------------------------------------------------------------
+def _taste(profile_keys: tuple) -> str:
+    """抓取口味的指纹，进缓存文件名。
+
+    **不加这个的话**：`cli.py profile --regenerate` 改了关键词之后，当天的缓存
+    还是按**旧**关键词过滤出来的结果，「新鲜事」那块看起来像"改了没生效"，
+    要等到第二天才变。这是个很难查的现象——用户不会想到是缓存。
+    """
+    blob = "|".join(",".join(v) if isinstance(v, (list, tuple)) else str(v)
+                     for v in profile_keys)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
+
+
 def _cache_path(name: str, day: date) -> Path:
+    # 注意日期在**末尾**：clear_cache 用 `*-<日期>.json` 通配，别改顺序
     return config.CACHE_DIR / f"{name}-{day.isoformat()}.json"
 
 
@@ -165,7 +227,7 @@ def _clean(s: str) -> str:
 def fetch_arxiv(day: date, use_cache: bool = True) -> tuple[list[dict], Optional[str]]:
     """抓 arXiv 最新论文。返回 (条目列表, 错误信息)。"""
     if use_cache:
-        cached = _read_cache("arxiv", day)
+        cached = _read_cache(f"arxiv-{_taste((config.ARXIV_CATEGORIES, config.ARXIV_KEYWORDS))}", day)
         if cached is not None:
             return cached, None
 
@@ -183,7 +245,7 @@ def fetch_arxiv(day: date, use_cache: bool = True) -> tuple[list[dict], Optional
         return [], "arXiv 抓取失败（网络不通或接口限流）"
 
     items = _parse_arxiv(raw)
-    _write_cache("arxiv", day, items)
+    _write_cache(f"arxiv-{_taste((config.ARXIV_CATEGORIES, config.ARXIV_KEYWORDS))}", day, items)
     return items, None
 
 
@@ -193,7 +255,7 @@ def fetch_arxiv(day: date, use_cache: bool = True) -> tuple[list[dict], Optional
 def fetch_github(day: date, use_cache: bool = True) -> tuple[list[dict], Optional[str]]:
     """搜 GitHub 上相关的热门仓库。返回 (条目列表, 错误信息)。"""
     if use_cache:
-        cached = _read_cache("github", day)
+        cached = _read_cache(f"github-{_taste((config.GITHUB_QUERIES,))}", day)
         if cached is not None:
             return cached, None
 
@@ -244,7 +306,7 @@ def fetch_github(day: date, use_cache: bool = True) -> tuple[list[dict], Optiona
         deduped.append(r)
 
     if deduped:
-        _write_cache("github", day, deduped)
+        _write_cache(f"github-{_taste((config.GITHUB_QUERIES,))}", day, deduped)
     return deduped, error
 
 

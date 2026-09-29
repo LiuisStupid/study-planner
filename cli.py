@@ -8,6 +8,9 @@
   python cli.py status       看整体进度
   python cli.py check       课程表自检（依赖成环 / id 重复 / 指向不存在的条目）
   python cli.py check-links  逐个校验课程表里的 URL 是否还能打开
+  python cli.py profile [...]  看/改画像，并按画像生成自己的课程表（--regenerate）
+  python cli.py export [路径]  把进度+画像+课程表打包（换机器/重新 clone 时用）
+  python cli.py import <路径>  从包里恢复（--dry-run 只看不动）
   python cli.py restart      重启网页面板（自动停掉旧的，再前台启动）
   python cli.py serve        同上（保留旧名字）
 
@@ -17,14 +20,26 @@
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import date
+from pathlib import Path
 
-from study_planner import config, knowledge, planner, progress as progress_mod, render
+from study_planner import (
+    bundle,
+    config,
+    curriculum,
+    knowledge,
+    llm_plan,
+    planner,
+    progress as progress_mod,
+    render,
+)
 from study_planner.knowledge import ITEM_BY_ID, ITEMS, TRACKS
 
 
@@ -125,9 +140,13 @@ def cmd_status() -> None:
     today = date.today()
     stats = prog.track_stats()
 
+    stale = prog.stale_done_count()
     print(f"进度 {prog.done_count()}/{len(ITEMS)}　"
           f"连续 {prog.current_streak(today)} 天　"
-          f"最长 {prog.longest_streak} 天\n")
+          f"最长 {prog.longest_streak} 天"
+          # 换过课程表才有这个。说出来而不是藏起来——数字对不上时用户才知道为什么
+          + (f"　（另有 {stale} 条已完成的不在当前课程表里）" if stale else "")
+          + "\n")
 
     for t in TRACKS:
         st = stats.get(t.id, {"done": 0, "total": 0, "unlocked": 0})
@@ -140,8 +159,329 @@ def cmd_status() -> None:
     if due:
         print(f"\n待复习 {len(due)} 条：")
         for i in due[:10]:
-            print(f"  - {ITEM_BY_ID[i].title}")
+            # 必须用 .get()：due_for_review 返回的是状态文件里的 id，
+            # 换过课程表之后可能已经不在 ITEM_BY_ID 里了。原来这里是裸索引，
+            # 那种 id 一旦到期就让整个 status 命令崩掉。
+            it = ITEM_BY_ID.get(i)
+            print(f"  - {it.title if it else i + '（已不在当前课程表，可忽略）'}")
     print("\n下一步：python cli.py today")
+
+
+PROFILE_FIELDS = ("topics", "level", "goal", "daily_minutes",
+                  "arxiv_categories", "arxiv_keywords", "github_queries")
+
+
+def _print_profile(profile: dict) -> None:
+    if not profile:
+        print("还没有画像（用的是内置课程表：端到端自动驾驶 / RL / VLA）。\n")
+        print("想换成你自己的方向：")
+        print('  python cli.py profile --topics "量子计算与纠错" '
+              '--level "写过 Qiskit" --regenerate')
+        return
+
+    print(f"画像文件：{config.PROFILE_PATH}")
+    for k in PROFILE_FIELDS:
+        v = profile.get(k)
+        if v in (None, "", []):
+            continue
+        if isinstance(v, list):
+            v = "、".join(str(x) for x in v)
+        print(f"  {k:<18} {v}")
+    print()
+
+
+def cmd_profile() -> None:
+    """看 / 改 / 按画像重新生成课程表。
+
+    带参数时**完全不交互**——这是刻意的：「想学什么方向」不是秘密，可以在对话里
+    问用户，AI 拿到答案就能直接跑这条命令。对比 onboard.py 收 API key 那条路径，
+    那边必须由用户在自己的终端里输，因为 key 是秘密。
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python cli.py profile",
+        description="看/改画像，并按画像生成课程表。不带参数就是查看现状。",
+    )
+    ap.add_argument("--topics", help="想学的方向，一句话")
+    ap.add_argument("--level", help="已有的基础")
+    ap.add_argument("--goal", help="想达到什么")
+    ap.add_argument("--minutes", type=int, help="每天能投入多少分钟")
+    ap.add_argument("--arxiv-cats", dest="cats", help="arXiv 分类，逗号分隔，如 quant-ph,cs.LG")
+    ap.add_argument("--keywords", help="arXiv 关键词，逗号分隔，**要用英文**")
+    ap.add_argument("--repos", help="GitHub 搜索词，逗号分隔")
+    ap.add_argument("--regenerate", action="store_true", help="调模型按画像生成课程表")
+    ap.add_argument("--accept-dead-links", action="store_true",
+                    help="arXiv 抽查有查不到的编号时也照样写入")
+    ap.add_argument("--reset", action="store_true", help="删掉生成的课程表，回到内置那份")
+    ap.add_argument("--yes", action="store_true", help="跳过确认")
+    args = ap.parse_args(sys.argv[2:])
+
+    def split(v):
+        return [x.strip() for x in re.split(r"[,，、;；]", v or "") if x.strip()] or None
+
+    if args.reset:
+        if config.CURRICULUM_PATH.exists():
+            config.CURRICULUM_PATH.unlink()
+            print(f"已删除 {config.CURRICULUM_PATH}，回到内置课程表。")
+            print("重启面板后生效：python cli.py restart")
+        else:
+            print("本来就没有生成过课程表，用的是内置那份。")
+        return
+
+    # ---- 合并画像 ----
+    profile = {}
+    if config.PROFILE_PATH.exists():
+        try:
+            profile = json.loads(config.PROFILE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            profile = {}
+
+    changed = {}
+    if args.topics:
+        changed["topics"] = args.topics
+    if args.level:
+        changed["level"] = args.level
+    if args.goal:
+        changed["goal"] = args.goal
+    if args.minutes:
+        changed["daily_minutes"] = args.minutes
+    if args.cats:
+        changed["arxiv_categories"] = split(args.cats)
+    if args.keywords:
+        changed["arxiv_keywords"] = split(args.keywords)
+    if args.repos:
+        changed["github_queries"] = split(args.repos)
+
+    if not changed and not args.regenerate:
+        _print_profile(profile)
+        return
+
+    if changed:
+        profile.update({k: v for k, v in changed.items() if v})
+        profile["format"] = config.PROFILE_FORMAT
+        profile["version"] = config.PROFILE_VERSION
+        config.PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        config.PROFILE_PATH.write_text(
+            json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"已更新画像：{config.PROFILE_PATH}")
+        for k, v in changed.items():
+            print(f"  {k} = {v if not isinstance(v, list) else '、'.join(v)}")
+        applied = config.apply_profile(profile)
+        print(f"  本次进程生效的项：{'、'.join(applied) if applied else '（无）'}")
+
+    if not args.regenerate:
+        print("\n重启面板后生效：python cli.py restart")
+        print("想按这份画像生成课程表：加 --regenerate")
+        return
+
+    # ---- 生成课程表 ----
+    if not profile.get("topics"):
+        print("\n❌ 先生成画像：--topics 是必填的（生成课程表要靠它）。")
+        raise SystemExit(1)
+
+    print("\n调模型生成课程表…（这一下会花你的 API 额度，10–60 秒）")
+    result = llm_plan.generate_curriculum(profile)
+    if not result["ok"]:
+        print(f"❌ 生成失败：{result['error']}")
+        print("   没有写入任何文件——原来的课程表原封不动。")
+        raise SystemExit(1)
+
+    tracks, p1 = curriculum.parse_tracks(result["tracks"])
+    items, p2 = curriculum.parse_items(result["items"])
+    problems = p1 + p2
+    if tracks and items:
+        problems += curriculum.validate(tracks, items)
+
+    if problems:
+        print(f"❌ 生成的课程表没通过校验（{len(problems)} 个问题），**没有写入**：")
+        for p in problems[:8]:
+            print(f"   - {p}")
+        if len(problems) > 8:
+            print(f"   …另有 {len(problems) - 8} 个")
+        print("\n再跑一次通常会好一些（模型每次结果不一样）。")
+        raise SystemExit(1)
+
+    print("✅ 结构校验通过")
+    print(curriculum.summary(tracks, items))
+    print()
+
+    # arXiv 抽查：一次请求问清所有编号是否存在。**不拦写盘**——
+    # 网络抖动和编造编号在这里长得一样，用网络结果否决一份结构完好的课程表
+    # 会让用户在一个其实没问题的东西上反复重试。
+    arxiv_ids = []
+    for it in items:
+        m = re.search(r"arxiv\.org/abs/(\d{4}\.\d{4,5})", it.url)
+        if m:
+            arxiv_ids.append((it.id, m.group(1)))
+
+    if arxiv_ids:
+        from study_planner import sources
+
+        print(f"arXiv 抽查（1 次请求，{len(arxiv_ids)} 条）…")
+        found = sources.verify_arxiv_ids([a for _, a in arxiv_ids])
+
+        if not found:
+            # **整批查不成 ≠ 编号是假的。** 网络不通、被限流（实测遇到过一次 429）
+            # 都会走到这里。把它当成"全是编的"会拒绝一份其实没问题的课程表，
+            # 还让用户在一个不存在的问题上反复重试。所以只提示，不拦。
+            print("  ⚠️ 这次没查成（网络或限流），跳过抽查。")
+            print("     链接对不对请自己过一眼，或者之后跑 python cli.py check-links。")
+        else:
+            missing = [(iid, aid) for iid, aid in arxiv_ids if not found.get(aid)]
+            print(f"  ✅ {len(arxiv_ids) - len(missing)} 条编号真实存在")
+            if missing:
+                print(f"  ⚠️ {len(missing)} 条查不到（可能是编的）：")
+                for iid, aid in missing[:5]:
+                    print(f"       {iid} → https://arxiv.org/abs/{aid}")
+                if not args.accept_dead_links and not args.yes:
+                    print("\n这些编号在 arXiv 上不存在。**没有写入。**")
+                    print("  要么再跑一次生成（模型每次不一样），")
+                    print("  要么确认可以接受后加 --accept-dead-links。")
+                    raise SystemExit(1)
+                print("  （--accept-dead-links，照样写入）")
+
+    # 模型给的抓取口味只在用户没自己指定过时才写进画像
+    for key in ("arxiv_keywords", "github_queries", "arxiv_categories"):
+        if result.get(key) and not profile.get(key):
+            profile[key] = result[key]
+    profile["format"] = config.PROFILE_FORMAT
+    profile["version"] = config.PROFILE_VERSION
+    config.PROFILE_PATH.write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    curriculum.save_file(config.CURRICULUM_PATH, tracks, items, meta={
+        "generated_by": llm_plan.MODEL_PLAN,
+        "topics": profile.get("topics", ""),
+    })
+
+    print(f"\n✅ 已写入 {config.CURRICULUM_PATH}")
+    print("   这份课程表是 AI 生成的，建议自己过一眼——尤其是标题和链接对不对。")
+    stale = progress_mod.Progress.load().stale_ids()
+    if stale:
+        print(f"\n⚠️ 你原来的进度里有 {len(stale)} 条不在新课程表里。"
+              "它们**保留在状态文件里**，只是不再计入进度；换回旧的课程表就会回来。")
+    print("\n重启面板后生效：python cli.py restart")
+
+
+_NO_TTY_IMPORT = """\
+导入会**覆盖**你现在的进度、画像和课程表，所以需要你确认一下。
+
+AI 这边没有终端，也读不到你的确认，所以不能替你按这个键。
+请在你自己的终端里跑下面这条（把 <包> 换成实际路径）：
+
+    cd {root}
+    {python} cli.py import <包> --yes
+
+想先看看会发生什么、不写入任何东西：
+
+    {python} cli.py import <包> --dry-run
+"""
+
+
+def _repo_guard(path) -> bool:
+    """包不能落在仓库里——这个仓库是公开的，进度属于个人数据。
+
+    返回 True 表示可以继续写。
+    """
+    try:
+        p = Path(path).resolve()
+    except OSError:
+        return True
+    root = config.ROOT.resolve()
+    if root == p or root in p.parents:
+        print(f"❌ 拒绝写到仓库里：{p}")
+        print(f"   这个仓库是公开的，进度和画像属于你的个人数据，别推进去。")
+        print(f"   默认路径是 {bundle.DEFAULT_DIR}，在仓库外面。")
+        return False
+    return True
+
+
+def cmd_export() -> None:
+    """把进度 + 画像 + 课程表打包成一个文件，供换机器/重新 clone 时恢复。
+
+    默认落在 ~/study-planner-backup/，**不在 data/ 里**——data/ 正是重新
+    clone 会消失的东西，备份放那儿等于没备份。
+    """
+    arg = sys.argv[2] if len(sys.argv) > 2 else ""
+    path = Path(arg).expanduser() if arg else bundle.default_path()
+
+    if not _repo_guard(path):
+        raise SystemExit(1)
+
+    prog = load()
+    profile = {}
+    if config.PROFILE_PATH.exists():
+        try:
+            profile = json.loads(config.PROFILE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            profile = {}
+
+    payload = bundle.build(prog, profile, bundle.read_curriculum_file())
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError as e:
+        print(f"❌ 写不了 {path}：{e}")
+        raise SystemExit(1)
+
+    c = payload["counts"]
+    print(f"✅ 已导出到 {path}")
+    print(f"   课程表  {'自带' if payload.get('curriculum') else '无（当前也没生成过）'}"
+          f"　画像  {'有' if profile else '无'}"
+          f"　进度  已完成 {c['done']}"
+          + (f"（另有 {c['stale_done']} 条不在当前课程表里）" if c.get("stale_done") else ""))
+    print()
+    print("   这个文件**不在 git 里**，重新 clone 时不会跟着走。")
+    print("   想换机器用，就把它复制到网盘/私有仓；到新机器上跑：")
+    print("       python cli.py import <包的路径>")
+
+
+def cmd_import() -> None:
+    """从备份包恢复。**会覆盖**现有进度——没确认过就不动手。"""
+    if len(sys.argv) < 3:
+        raise SystemExit("用法：python cli.py import <包路径> [--dry-run] [--yes]")
+
+    path = Path(sys.argv[2]).expanduser()
+    dry_run = "--dry-run" in sys.argv[3:]
+    assume_yes = "--yes" in sys.argv[3:]
+
+    data, err = bundle.inspect(path)
+    if err:
+        print(f"❌ {err}")
+        raise SystemExit(1)
+
+    print(f"将要导入 {path}")
+    print(bundle.describe(data, load()))
+    print()
+
+    if dry_run:
+        print("--dry-run：什么都没写。")
+        return
+
+    # 没有 TTY 又没有 --yes 就停手并把命令打印出来。
+    # 和 onboard.py 收凭据那条路径同一个纪律：不能让「我检查一下」
+    # 变成「我把你的进度覆盖了」。
+    if not assume_yes and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(_NO_TTY_IMPORT.format(root=config.ROOT, python=sys.executable))
+        raise SystemExit(2)
+
+    if not assume_yes:
+        if input("确认覆盖？[y/N] ").strip().lower() not in ("y", "yes"):
+            print("未做任何修改。")
+            return
+
+    written = bundle.apply(data)
+    print("✅ 已恢复：")
+    for w in written:
+        print(f"   {w}")
+    print(f"   覆盖前的旧文件备份在 {config.BACKUP_DIR}")
+    print()
+    print("⚠️ 必须重启面板才生效——课程表是进程启动时读的，")
+    print("   正在跑的面板会把旧课程表一直用下去。")
+    print("       python cli.py restart")
 
 
 def cmd_check() -> None:
@@ -305,6 +645,9 @@ _COMMANDS = {
     "status": cmd_status,
     "check": cmd_check,
     "check-links": cmd_check_links,
+    "profile": cmd_profile,
+    "export": cmd_export,
+    "import": cmd_import,
     "restart": cmd_restart,
     "serve": cmd_serve,
 }
