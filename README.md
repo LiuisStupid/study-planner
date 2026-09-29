@@ -5,6 +5,61 @@
 解决的问题不是「不知道学什么」，而是**没有稳定的每日节奏**：这三个方向的论文
 半衰期只有 3–12 个月，靠临时想起来去 arXiv 翻，容易变成追热点而没有主线。
 
+## 🚀 怎么开始
+
+> **只读这一节就够了。** 从「它做什么」往下都是参考手册，需要时再查。
+
+### 方式一：用 Claude Code（推荐）
+
+在这个仓库目录里打开 Claude Code，说一句「**这个仓库怎么跑**」，
+或者输入 `/study-planner-setup`。它会：
+
+1. **体检** —— 检查 Python 版本、venv、依赖，以及已有的 API key **能不能真的调通**
+2. **缺什么装什么** —— 建 `.venv`、按 `requirements.txt` 装依赖（幂等，重复跑不会重装）
+3. **凭据已经能用的话就直接跳到启动**，不会让你再配一遍
+4. 需要配的话，把一条命令交给你 —— **你在自己的终端里**填 key，
+   key 不经过对话，也不会被写进会话记录
+5. 告诉你启动命令
+
+背后的脚本也可以单独跑，不依赖 Claude Code：
+
+```bash
+python3 .claude/skills/study-planner-setup/scripts/onboard.py --check     # 体检 + 验证 key
+python3 .claude/skills/study-planner-setup/scripts/onboard.py --install   # 只建环境
+.venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py    # 交互式配凭据
+```
+
+### 方式二：手动三步
+
+```bash
+# 建一个独立虚拟环境（这个项目不依赖别的仓库）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# 看今天的计划
+.venv/bin/python cli.py today
+
+# 启动网页面板（推荐用 restart，见下方说明）
+.venv/bin/python cli.py restart     # http://127.0.0.1:8766
+```
+
+配凭据（面板里「AI 点评」和阅读器问答要用，不配也能跑，只是少了这两块）：
+
+```bash
+cp .env.example .env      # 然后填 key；或者用上面那个交互式脚本
+chmod 600 .env
+```
+
+### 跑起来之后
+
+打开 http://127.0.0.1:8766
+
+- **今日**页：每条可以直接勾「完成 / 没读懂 / 跳过」
+- 点条目标题进**论文阅读器**：左边原文，右边可以随时问 AI。
+  **用鼠标选中左边任意一段会浮出「问 AI」**，点一下就能就着那段话提问
+
+---
+
 ## 它做什么
 
 每天给你一份 **30–45 分钟**的计划，四块内容：
@@ -24,27 +79,6 @@
 **2. 同一天的计划是确定的。** 算法对 `(进度, 日期)` 完全确定：反复刷新页面得到同一份计划
 （不会每次刷新都换一批让你无所适从），换天才变化。打散用的是 `hashlib` 而不是内置
 `hash()`——后者按进程加盐，跨进程不稳定。
-
-## 快速开始
-
-**在 Claude Code 里打开这个仓库**，直接说「这个仓库怎么跑」，或者输入
-`/study-planner-setup`。它会检查 Python 版本、建 venv、按 `requirements.txt`
-装依赖，然后让你**在自己的终端里**填一次 API key（key 不会经过对话），
-最后告诉你启动命令。
-
-不想用 Claude Code 的话，手动三步：
-
-```bash
-# 建一个独立虚拟环境（这个项目不依赖别的仓库）
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# 看今天的计划
-.venv/bin/python cli.py today
-
-# 启动网页面板（推荐用 restart，见下方说明）
-.venv/bin/python cli.py restart     # http://127.0.0.1:8766
-```
 
 ## 命令行
 
