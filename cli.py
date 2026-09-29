@@ -12,7 +12,9 @@
   python cli.py export [路径]  把进度+画像+课程表打包（换机器/重新 clone 时用）
   python cli.py import <路径>  从包里恢复（--dry-run 只看不动）
   python cli.py restart      重启网页面板（自动停掉旧的，再前台启动）
-  python cli.py serve        同上（保留旧名字）
+  python cli.py restart -d   同上，但后台启动、立刻返回（给 AI / 脚本用）
+  python cli.py stop         停掉网页面板
+  python cli.py serve        同 restart（保留旧名字）
 
 <id> 支持只写前缀，够唯一就行。例如 python cli.py done rlvla-fpo
 
@@ -21,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -561,8 +564,8 @@ def cmd_check_links() -> None:
 def _port_pids(port: int) -> list[str]:
     """找出正在监听某个端口的进程 PID。
 
-    用 lsof 而不是 `pkill -f "python app.py"`——venv 里的 python 实际解析到
-    系统 framework 的 `Python`（大写 P），按进程名匹配根本打不中。
+    用 lsof 而不是 `pkill -f "python app.py"`——macOS 上的 `python3` 是个壳，
+    真进程叫 `Python`（大写 P），按小写的进程名匹配根本打不中。
     按端口找才可靠。
     """
     try:
@@ -575,45 +578,124 @@ def _port_pids(port: int) -> list[str]:
     return [line.strip() for line in out.split() if line.strip()]
 
 
-def cmd_restart() -> None:
-    """重启网页面板：先停掉占着端口的旧进程，再前台启动。
+def _stop_panel(port: int) -> list[str]:
+    """停掉占着端口的旧面板。返回被停掉的 PID（空列表表示本来就没有）。
 
-    前台启动是刻意的——这样 Ctrl+C 一直有效。如果后台化（结尾加 `&`），
-    终端一关你就只能靠 `lsof -ti tcp:8766 | xargs kill` 才能停掉它。
+    只报告 PID、**不擅自判断该不该停**——叫这个名字的命令（restart / stop）
+    语义就是"顶掉旧的"，所以停是它该做的事。
     """
-    port = config.DASHBOARD_PORT
-
     # 下面这些 print 都带 flush——重定向到文件时 stdout 是块缓冲的，
     # 不加的话提示要等进程退出才刷出来，看起来像卡住了。
     pids = _port_pids(port)
-    if pids:
-        print(f"发现旧面板在运行（PID {', '.join(pids)}），正在停止…", flush=True)
-        for pid in pids:
-            subprocess.run(["kill", pid], check=False)
+    if not pids:
+        return []
 
-        # 等端口真正释放，别急着启动（否则新进程会 bind 失败然后静默退出）
-        for _ in range(20):
-            if not _port_pids(port):
-                break
-            time.sleep(0.25)
+    print(f"发现旧面板在运行（PID {', '.join(pids)}），正在停止…", flush=True)
+    for pid in pids:
+        subprocess.run(["kill", pid], check=False)
 
-        still = _port_pids(port)
-        if still:
-            print(f"  普通 kill 没停掉，改用 kill -9（PID {', '.join(still)}）", flush=True)
-            for pid in still:
-                subprocess.run(["kill", "-9", pid], check=False)
-            time.sleep(0.5)
+    # 等端口真正释放，别急着启动（否则新进程会 bind 失败然后静默退出）
+    for _ in range(20):
+        if not _port_pids(port):
+            return pids
+        time.sleep(0.25)
 
-        if _port_pids(port):
-            raise SystemExit(f"❌ 端口 {port} 仍被占用，请手动检查：lsof -i tcp:{port}")
-        print("  已停止", flush=True)
-    else:
+    still = _port_pids(port)
+    print(f"  普通 kill 没停掉，改用 kill -9（PID {', '.join(still)}）", flush=True)
+    for pid in still:
+        subprocess.run(["kill", "-9", pid], check=False)
+    time.sleep(0.5)
+
+    if _port_pids(port):
+        raise SystemExit(f"❌ 端口 {port} 仍被占用，请手动检查：lsof -i tcp:{port}")
+    return pids
+
+
+def _detached_env() -> dict:
+    """后台面板用的环境变量。
+
+    Claude Code 会把它**自己那份** ANTHROPIC_* 注入给子进程（实测 CLAUDECODE=1
+    时是设好的）。不摘掉的话，AI 帮忙起的这个面板会拿 Claude Code 的凭据，
+    而不是用户配在 .env 里的那份——而体检验的恰恰是后者，两边就对不上了：
+    体检说"验过了"，跑起来的其实是另一个身份。
+
+    用户的终端里不会有 CLAUDECODE，所以这只影响"由 AI 起面板"这一种情况，
+    人自己敲 `cli.py restart` 时环境原样保留。
+    """
+    env = dict(os.environ)
+    if env.get("CLAUDECODE"):
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                  "ANTHROPIC_BASE_URL", "STUDY_PLANNER_MODEL"):
+            env.pop(k, None)
+    return env
+
+
+def _start_detached(port: int) -> None:
+    """后台启动面板，并确认它真的起来了再返回。
+
+    两件事让它能活过调用者：
+      · start_new_session=True —— 另起一个会话，调它的那个 shell（终端、
+        或者 AI 那边一次性执行的命令）退出时不会顺带把它 kill 掉；
+      · stdout/stderr 重定向到文件 —— 不然它继承的管道一关，往里写日志
+        就会收到 SIGPIPE。
+    """
+    log = config.ROOT / "data" / "panel.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(log, "ab") as fh:
+        proc = subprocess.Popen(
+            [sys.executable, str(config.ROOT / "app.py")],
+            cwd=str(config.ROOT), env=_detached_env(),
+            stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+            start_new_session=True,
+        )
+
+    for _ in range(40):                      # 最多等 10 秒
+        pids = _port_pids(port)
+        if pids:
+            print(f"✅ 面板已在后台运行（PID {', '.join(pids)}）", flush=True)
+            print(f"   http://{config.DASHBOARD_HOST}:{port}", flush=True)
+            print(f"   日志 {log}", flush=True)
+            print("   停止 python3 cli.py stop", flush=True)
+            return
+        if proc.poll() is not None:
+            raise SystemExit(
+                f"❌ 面板起来就退了（退出码 {proc.returncode}）。日志：\n   {log}")
+        time.sleep(0.25)
+
+    raise SystemExit(f"❌ 等了 10 秒，{port} 还是没人监听。日志：\n   {log}")
+
+
+def cmd_restart() -> None:
+    """重启网页面板：先停掉占着端口的旧进程，再启动。
+
+    默认**前台**启动——这样 Ctrl+C 一直有效，是给人用的。
+    `--detach`（简写 `-d`）则后台起、确认起来了就返回，是给 AI 和脚本用的：
+    前台模式在那种场景下永远不返回，会把整条命令挂到超时。
+    """
+    detach = "--detach" in sys.argv[2:] or "-d" in sys.argv[2:]
+    port = config.DASHBOARD_PORT
+
+    if not _stop_panel(port):
         print(f"端口 {port} 空闲，直接启动。", flush=True)
+
+    if detach:
+        _start_detached(port)
+        return
 
     print(f"→ 打开 http://{config.DASHBOARD_HOST}:{port}   （按 Ctrl+C 停止）\n", flush=True)
 
     # 前台运行。用 call 而不是 Popen，这样 Ctrl+C 能传到子进程。
     subprocess.call([sys.executable, str(config.ROOT / "app.py")])
+
+
+def cmd_stop() -> None:
+    """停掉面板。后台（--detach）起来的那个尤其需要它——它没有终端可 Ctrl+C。"""
+    port = config.DASHBOARD_PORT
+    if not _stop_panel(port):
+        print(f"端口 {port} 上没有面板在跑。")
+        return
+    print(f"已停止（端口 {port} 现在空着）。")
 
 
 def cmd_serve() -> None:
@@ -649,6 +731,7 @@ _COMMANDS = {
     "export": cmd_export,
     "import": cmd_import,
     "restart": cmd_restart,
+    "stop": cmd_stop,
     "serve": cmd_serve,
 }
 

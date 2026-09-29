@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""让这个仓库在你的机器上跑起来：建环境、装依赖、配凭据、验证。
+"""让这个仓库在你的机器上跑起来：装依赖、配凭据、验证。
 
     python3 onboard.py --check     只读体检 + 验证凭据，不改任何东西（退出码见下）
-    python3 onboard.py --install   只建 venv + 装依赖，不碰凭据
+    python3 onboard.py --install   只装依赖（pip 到手边这个 python3），不碰凭据
     python3 onboard.py             交互式：环境 + 凭据一次做完
 
 退出码（给自动化用的，`--check` 靠它表态）：
     0  就绪：环境齐、凭据**验证通过**，直接启动即可
-    1  环境坏了（Python 版本不够、venv 建不出来、依赖装不上）
+    1  环境坏了（Python 版本不够、pip 用不了、依赖装不上）
     2  需要交互式终端才能继续（本脚本没有被 TTY 连着）
     3  需要配或重配凭据（没有凭据，或 key 被端点拒绝）
     4  凭据有效，但模型名不被接受（改 STUDY_PLANNER_MODEL 即可，不用重配 key）
@@ -17,7 +17,7 @@
 「配了但配错了」和「没配」在面板里表现得一模一样（AI 功能不工作），
 只有真发一次请求才分得出来。断网或不想联网时加 `--no-verify` 退回只看配置。
 
-## 两条设计约束，改这个文件前先读
+## 三条设计约束，改这个文件前先读
 
 **一、凭据只能由用户在自己的终端里输入。**
 API key 一旦经过对话（哪怕只是被打印出来），就会被发送给模型提供方并落进
@@ -28,6 +28,18 @@ API key 一旦经过对话（哪怕只是被打印出来），就会被发送给
 Claude Code 会把自己那份 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL 注入给它
 启动的子进程。拿环境变量当判据，会给一个从没配过任何东西的用户报"已配置好"——
 这是实测踩出来的。
+
+**三、不建虚拟环境，就用手边这个 python3。**
+这个项目的依赖只有 flask 和 anthropic 两个，不值得为它引入 venv——
+而 venv 恰恰是换机器时最容易卡住的一步（Debian/Ubuntu 上要
+`sudo apt install python3-venv`，AI 没法 sudo，整个流程就断在这里）。
+
+所以装依赖一律用 `sys.executable`，即**正在跑本脚本的那个解释器**：
+你在系统 python3 下跑就装进系统 python3，你自己在 venv 里跑就装进那个 venv。
+没有"挑解释器"的逻辑，也就不存在"装到了 A、跑起来用的是 B"这种最难查的问题。
+
+**绝不 sudo。** 系统 python 被 PEP 668 挡住时退到 `--user` 装进 `~/.local`
+（见 PIP_ATTEMPTS），那已经足够隔离，也不碰系统包管理器管的地盘。
 """
 from __future__ import annotations
 
@@ -200,8 +212,39 @@ def effective_credentials(src: Path):
 # ---------------------------------------------------------------------------
 # 环境检查 / 安装
 # ---------------------------------------------------------------------------
-def venv_python(root: Path) -> Path:
-    return root / ".venv" / "bin" / "python"
+def project_python() -> Path:
+    """这个项目会用哪个解释器：正在跑本脚本的这个。
+
+    刻意不建 venv——用手边这个 python3 就行（理由见文件头的约束三）。
+    谁跑本脚本就用谁装，所以在 venv 里跑 `onboard.py` 就等于装进那个 venv，
+    不存在"装到了 A、跑起来用的是 B"。
+    """
+    return Path(sys.executable)
+
+
+def foreign_venv(root: Path) -> str:
+    """当前解释器如果来自**别的**虚拟环境，返回那个环境的路径，否则空串。
+
+    不是错，但必须说一声：接着装的依赖会落进那个项目的地盘。这个警告是
+    实测出来的——开发机上 `python3` 就解析到另一个仓库的 .venv 上，
+    不点破的话「我明明装过了」和「怎么装到那边去了」会一起发生。
+    """
+    if sys.prefix == sys.base_prefix:       # 系统 python，没在 venv 里
+        return ""
+    if Path(sys.prefix).resolve() == (root / ".venv").resolve():
+        return ""                            # 本仓库自己的 venv，正常
+    return sys.prefix
+
+
+def python_cmd(root: Path) -> str:
+    """写给用户看的命令里该写哪个解释器。
+
+    多数情况下就是 `python3`。唯独直接敲 `.venv/bin/python onboard.py` 而没
+    activate 的时候，`python3` 会解析到别处，所以那时把 venv 的路径打全。
+    """
+    if sys.prefix != sys.base_prefix:      # 当前就在某个 venv 里
+        return rel(root, project_python())
+    return "python3"
 
 
 def _run(cmd, **kw):
@@ -216,45 +259,66 @@ def check_python() -> tuple:
     return exe, ver, info >= (3, 9)
 
 
-def deps_installed(root: Path) -> bool:
+def deps_installed(py: Path) -> bool:
     """靠 import 判断，而不是读 requirements.txt 比对版本。"""
-    py = venv_python(root)
-    if not py.is_file():
-        return False
     code = "import " + ", ".join(REQUIRED_IMPORTS)
-    return _run([str(py), "-c", code]).returncode == 0
+    return py.is_file() and _run([str(py), "-c", code]).returncode == 0
 
 
-def ensure_venv(root: Path, say=print) -> bool:
-    py = venv_python(root)
-    if py.is_file() and os.access(py, os.X_OK):
+# 装依赖的候选姿势，**顺序有意义**：先试最干净的，被系统挡回来再一步步退。
+# 退回 --user 只写 ~/.local，不碰系统包管理器管的地盘；仍然**不用 sudo**。
+PIP_ATTEMPTS = (
+    ("直接装", ("install",)),
+    ("装到用户目录（--user）", ("install", "--user")),
+    ("装到用户目录 + 放行外部管理环境（PEP 668，Debian 12 / Ubuntu 23 起）",
+     ("install", "--user", "--break-system-packages")),
+)
+
+
+def ensure_pip(py: Path, say=print) -> bool:
+    """没 pip 就先弄一个出来。仍然不 sudo。
+
+    Debian 系把 ensurepip 的上游行为改掉了，可能直接失败——那时只能告诉
+    用户自己装，报清楚比瞎试强。
+    """
+    if _run([str(py), "-m", "pip", "--version"]).returncode == 0:
         return True
-    say("  → 建虚拟环境 .venv …")
-    try:
-        r = subprocess.run([sys.executable, "-m", "venv", str(root / ".venv")])
-    except OSError as e:
-        say(f"  ❌ 建 venv 失败：{e}")
-        return False
-    if r.returncode != 0:
-        say("  ❌ 建 venv 失败。Debian / Ubuntu 上通常要先装：")
-        say("       sudo apt install python3-venv")
-        return False
-    return True
+    say("  → 这个 python 没有 pip，试着用 ensurepip 引导一个…")
+    for flags in (("--upgrade",), ("--upgrade", "--user")):
+        if _run([str(py), "-m", "ensurepip", *flags]).returncode == 0:
+            if _run([str(py), "-m", "pip", "--version"]).returncode == 0:
+                return True
+    say("  ❌ 引导 pip 失败。手动装一个再回来跑本脚本：")
+    say("       Debian / Ubuntu   sudo apt install python3-pip")
+    say("       Fedora            sudo dnf install python3-pip")
+    say(f"       或者直接给这个解释器装：{py} -m ensurepip --upgrade")
+    return False
 
 
-def ensure_deps(root: Path, say=print) -> bool:
-    if deps_installed(root):
+def ensure_deps(root: Path, py: Path, say=print) -> bool:
+    """把 requirements.txt 装进 `py`。幂等：已经齐了就什么都不做。"""
+    if deps_installed(py):
         say("  → 依赖已就绪，跳过安装（本脚本可以反复跑）")
         return True
-    say("  → 安装 requirements.txt …")
-    r = subprocess.run(
-        [str(venv_python(root)), "-m", "pip", "install", "-r",
-         str(root / "requirements.txt")]
-    )
-    if r.returncode != 0:
-        say("  ❌ 依赖安装失败，上面是 pip 的输出。")
-        return False
-    return True
+
+    other = foreign_venv(root)
+    if other:
+        say(f"  ⚠️ 这个解释器来自别的虚拟环境：{other}")
+        say("     依赖会装进那里，不动系统 python。")
+        say("     想装到系统 python：先 deactivate，再重跑本脚本。")
+
+    req = str(root / "requirements.txt")
+    for label, flags in PIP_ATTEMPTS:
+        say(f"  → 装依赖：{label} …")
+        r = subprocess.run([str(py), "-m", "pip", *flags, "-r", req])
+        if r.returncode == 0 and deps_installed(py):
+            return True
+
+    say("  ❌ 依赖还是装不上，上面是 pip 的输出。")
+    if (root / ".venv").is_dir():
+        say("     仓库里有个旧的 .venv —— 现在不再用它了，依赖是往上面这个")
+        say("     解释器里装的。那个目录可以直接删掉。")
+    return False
 
 
 def listening_pids(port: int):
@@ -394,23 +458,30 @@ def do_check(root: Path, do_verify: bool = True) -> int:
     problems = []
     cred_code = OK
 
-    _, ver, ok_py = check_python()
-    print(f"  Python      {ver} {'✅' if ok_py else '❌ 需要 ≥ 3.9'}")
+    exe, ver, ok_py = check_python()
+    print(f"  Python      {ver} {'✅' if ok_py else '❌ 需要 ≥ 3.9'}  {exe}")
     if not ok_py:
         problems.append("python")
 
-    py = venv_python(root)
-    has_venv = py.is_file() and os.access(py, os.X_OK)
-    print(f"  虚拟环境    {'✅ .venv' if has_venv else '❌ 还没有 .venv'}")
-    if not has_venv:
-        problems.append("venv")
+    py = project_python()
+    has_pip = _run([str(py), "-m", "pip", "--version"]).returncode == 0
+    print(f"  pip         {'✅' if has_pip else '❌ 没有 pip'}")
+    if not has_pip:
+        problems.append("pip")
 
-    has_deps = deps_installed(root) if has_venv else False
-    deps_txt = ("✅ flask / anthropic 都能 import" if has_deps
-                else "❌ 缺依赖（需要装 requirements.txt）")
-    print(f"  依赖        {deps_txt}")
-    if has_venv and not has_deps:
+    has_deps = deps_installed(py)
+    print(f"  依赖        {'✅ flask / anthropic 都能 import' if has_deps else '❌ 缺依赖（需要装 requirements.txt）'}")
+    if not has_deps:
         problems.append("deps")
+        # 这个仓库以前用 .venv，旧用户会看着一个装满依赖的 .venv 发懵：
+        # 「明明装过」。点破它，否则下一步会去查错方向。
+        if (root / ".venv").is_dir():
+            print("              （仓库里的 .venv 已经不用了，依赖装在上面这个 python3 里）")
+
+    other = foreign_venv(root)
+    if other:
+        print(f"  ⚠️ 注意     当前 python3 来自**别的**虚拟环境：{other}")
+        print("             依赖会被装进它。想装到系统 python 就先 deactivate 再跑。")
 
     # --- 凭据：不只是"有没有配"，而是"能不能跑通" ---
     src = persisted_credential_source(root)
@@ -459,7 +530,9 @@ def do_check(root: Path, do_verify: bool = True) -> int:
     print()
     if problems:
         print("👉 环境还没就绪。跑这一条把它建起来（幂等，可以反复跑）：")
-        print(f"     python3 {rel(root, Path(__file__))} --install")
+        # 用 python_cmd 而不是写死 python3：如果是用别的解释器跑的本脚本，
+        # 写死 `python3` 会指向另一个 python，装完还是找不到依赖。
+        print(f"     {python_cmd(root)} {rel(root, Path(__file__))} --install")
         return BAD_ENV
 
     if cred_code == NEEDS_CRED:
@@ -467,7 +540,7 @@ def do_check(root: Path, do_verify: bool = True) -> int:
         print("   **请在你自己的终端里**跑，按提示填：")
         print()
         print(f"     cd {root}")
-        print(f"     {rel(root, venv_python(root))} {rel(root, Path(__file__))}")
+        print(f"     {python_cmd(root)} {rel(root, Path(__file__))}")
         print()
         print("   （问三个问题，写进 .env，权限 600。")
         print("     不要在 AI 对话里粘贴 key——那会被发送给模型提供方并留在记录里。）")
@@ -486,7 +559,9 @@ def do_check(root: Path, do_verify: bool = True) -> int:
         return UNVERIFIED
 
     print("✅ 一切就绪（环境 + 凭据都验过了）。启动面板：")
-    print("     .venv/bin/python cli.py restart")
+    # 带 -d：这段输出主要是被 AI 读走的，前台模式会把它挂到超时。
+    # 它自带"停掉旧的再起"，所以已经在跑也直接跑这条，不用先问。
+    print(f"     {python_cmd(root)} cli.py restart -d")
     return OK
 
 
@@ -521,7 +596,7 @@ def do_configure(root: Path, args) -> int:
 
     if not interactive and not args.from_file and not args.print_only:
         print(NO_TTY_TEXT.format(
-            root=root, python=rel(root, venv_python(root)),
+            root=root, python=python_cmd(root),
             script=rel(root, Path(__file__)), env=rel(root, env_path)))
         return NO_TTY
 
@@ -673,21 +748,21 @@ def do_configure(root: Path, args) -> int:
 
     print()
     print("下一步：")
-    print("     .venv/bin/python cli.py restart     # 重启面板，.env 只在启动时读一次")
+    print(f"     {python_cmd(root)} cli.py restart     # 重启面板，.env 只在启动时读一次")
     return OK
 
 
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="把 study-planner 跑起来：建环境、装依赖、配凭据。",
+        description="把 study-planner 跑起来：装依赖、配凭据。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="退出码：0 就绪 / 1 环境坏了 / 2 需要终端 / 3 要配凭据 / "
                "4 模型名不对 / 5 端点连不上没验成",
     )
     ap.add_argument("--check", action="store_true",
                     help="只读体检，并真发一次请求验证 key")
-    ap.add_argument("--install", action="store_true", help="只建 venv + 装依赖")
+    ap.add_argument("--install", action="store_true", help="只装依赖，不碰凭据")
     ap.add_argument("--provider", choices=list(PROVIDERS), help="服务商")
     ap.add_argument("--base-url", dest="base_url", help="兼容端点地址")
     ap.add_argument("--model", help="模型名")
@@ -706,24 +781,26 @@ def main() -> int:
         return do_check(root, do_verify=not args.no_verify)
 
     # --print-only / --from-file 是"只做凭据、别碰环境"的模式：它们要么用于测试、
-    # 要么只是预览，没有理由因此去建 venv 和联网装包。
+    # 要么只是预览，没有理由因此去联网装包。
     if args.print_only or args.from_file:
         return do_configure(root, args)
 
     print(f"📦 项目根：{root}\n")
     print("[1/2] 环境")
-    _, ver, ok_py = check_python()
+    exe, ver, ok_py = check_python()
     if not ok_py:
         print(f"  ❌ Python {ver} 太旧，需要 ≥ 3.9。")
         return BAD_ENV
-    if not ensure_venv(root):
+    py = project_python()
+    print(f"  → 解释器 {exe}")
+    if not ensure_pip(py):
         return BAD_ENV
-    if not ensure_deps(root):
+    if not ensure_deps(root, py):
         return BAD_ENV
 
     if args.install:
-        print("\n✅ 环境就绪。还要配凭据才能用 AI 功能——")
-        print(f"   在你自己的终端里跑：{rel(root, venv_python(root))} {rel(root, Path(__file__))}")
+        print("\n✅ 依赖就绪。还要配凭据才能用 AI 功能——")
+        print(f"   在你自己的终端里跑：{python_cmd(root)} {rel(root, Path(__file__))}")
         return NEEDS_CRED
 
     print("\n[2/2] 凭据")

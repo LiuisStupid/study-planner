@@ -3,7 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 虚拟环境
+# 虚拟环境。本项目**不用** venv——依赖直接 pip 装进系统 python，见
+# .claude/skills/study-planner-setup/。留着这两条是防止谁在仓库里顺手建了
+# 一个、然后不小心提交上去。
 .venv/
 venv/
 
@@ -14,7 +16,7 @@ venv/
 #   data/cache/          arXiv / GitHub 抓取缓存、已解析的论文正文
 #   data/backups/        cli.py import 覆盖之前的自动备份
 #   data/dead_links.txt  check-links 的产物
-# 换台机器就用 `python cli.py export` 打包带走，不要靠 git。
+# 换台机器就用 `python3 cli.py export` 打包带走，不要靠 git。
 data/
 
 # 进度导出包。默认落在 ~/study-planner-backup/，但万一有人把它导进仓库

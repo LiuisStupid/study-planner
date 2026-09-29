@@ -77,7 +77,7 @@ chmod 600 .env
 |---|---|
 | `--check` | 只读体检，并**真发一次请求验证 key** |
 | `--check --no-verify` | 只做静态检查，不联网（离线/CI 用） |
-| `--install` | 只建 venv + 装依赖，不碰凭据 |
+| `--install` | 只装依赖（pip 到手边这个 python3），不碰凭据 |
 | `--provider {anthropic,deepseek,custom}` | 跳过交互式选择 |
 | `--base-url` / `--model` | 同上 |
 | `--no-verify` | 不联网验证（离线环境） |
@@ -86,8 +86,38 @@ chmod 600 .env
 | `--env-file` | 写到别的路径 |
 | `--yes` | 所有确认都答 yes |
 
-`--check` 顺序检查：Python ≥3.9 → `.venv` 存在且可执行 → venv 里 `import flask, anthropic`
+`--check` 顺序检查：Python ≥3.9 → `pip` 可用 → 同一解释器里 `import flask, anthropic`
 → 持久化凭据来源并**实际验证** → 面板是否在跑（只报告 PID，**绝不 kill**）。
+每行都会把解释器的全路径打出来——「装进去的」和「跑起来的」不是同一个 python
+是这类问题里最难查的一种，直接摆出来。
+
+## 不用虚拟环境（这是刻意的）
+
+依赖只有 flask 和 anthropic 两个，不值得为它引入 venv；而 venv 恰恰是换机器时
+最容易卡住的一步（Debian/Ubuntu 要 `sudo apt install python3-venv`，AI 没法 sudo，
+流程就断在这儿）。所以这个项目直接跑在原生 python3 上。
+
+装依赖一律用 `sys.executable`，即**正在跑脚本的那个解释器**——谁调用就装给谁。
+没有"挑解释器"的逻辑，也就不存在"装到了 A、跑起来用的是 B"。
+
+系统 python 被 PEP 668 挡住时（Debian 12 / Ubuntu 23 起，报
+`externally-managed-environment`），`--install` 会自动依次退：
+
+| 顺序 | 命令 | 落点 |
+|---|---|---|
+| 1 | `pip install -r requirements.txt` | 系统站点包 |
+| 2 | `pip install --user -r ...` | `~/.local`（macOS 是 `~/Library/Python/3.x`） |
+| 3 | `pip install --user --break-system-packages -r ...` | 同上，只是放行 PEP 668 的拦截 |
+
+**任何一步都不用 sudo。** 退到 `--user` 已经足够隔离，也不会碰系统包管理器的地盘；
+`sudo pip` 才是真会把系统搞乱的那个。
+
+一个实测到的坑：开发机上 `python3` 可能解析到**另一个仓库的 .venv**
+（PATH 里它在前面）。那时依赖会装进那个项目。`--check` 会专门警告这件事，
+并且把解释器全路径打出来。
+
+想强制装到某一个特定的 python：直接用那个 python 跑本脚本即可，比如
+`/usr/bin/python3 .claude/skills/study-planner-setup/scripts/onboard.py --install`。
 
 ### 它验证的是哪一份凭据
 
@@ -103,7 +133,7 @@ chmod 600 .env
 **为什么判断依赖用 import 而不是比对版本号**：导入检查已经覆盖实际需求，
 逐条解析 `requirements.txt` 的版本下限并和 `importlib.metadata.version` 比对，
 是给一个已经满足的场景加 25 行复杂度。真怀疑版本漂移就手动
-`.venv/bin/pip install --upgrade -r requirements.txt`。
+`python3 -m pip install --upgrade -r requirements.txt`。
 
 ## 验证请求是怎么分类的
 
@@ -140,17 +170,45 @@ DeepSeek 的 Anthropic 兼容层是按模型名映射的，换个名字就是换
 ## 手动启动 / 停止面板
 
 ```bash
-.venv/bin/python cli.py restart      # 自动停旧的再前台启动（Ctrl+C 有效）
+python3 cli.py restart      # 自动停旧的，再**前台**启动（Ctrl+C 有效）
+python3 cli.py restart -d   # 同上但后台启动、起好就返回（AI / 脚本用这个）
+python3 cli.py stop         # 停掉
 ```
 
-面板变成孤儿进程时（比如用 `&` 后台化后又关了终端）：
+两种模式都会先停掉占着 8766 的旧面板（普通 kill 不行就 kill -9），
+**这是命令语义本身，不需要额外确认**。
+
+`-d`（`--detach`）做三件事：
+
+1. `start_new_session=True` —— 另起会话，调它的那个 shell 退出时带不走它；
+   所以 Claude Code 结束、终端关掉，面板都还在。
+2. stdout/stderr 落到 `data/panel.log`（这个目录本来就 gitignore）。
+3. **等端口真的监听了才返回**，最多 10 秒；起不来就打印日志路径并报错退出，
+   不会假装成功。
+
+### `-d` 会摘掉 AI 注入的凭据，这是刻意的
+
+Claude Code 会把它**自己那份** `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL`
+注入给子进程。不摘掉的话，AI 帮忙起的面板会拿 Claude Code 的凭据，而不是用户
+配在 `.env` 里的那份——**而 `--check` 验的恰恰是后者**，于是「体检说验过了」和
+「实际跑的是谁」就对不上。
+
+所以 `_detached_env()` 在 `CLAUDECODE=1` 时把 `ANTHROPIC_*` 和
+`STUDY_PLANNER_MODEL` 摘掉，让面板走用户自己的持久化配置。判断依据是
+`CLAUDECODE`：用户自己的终端里不会有它，所以**人自己敲 `restart` 时环境原样保留**，
+只影响"由 AI 起面板"这一种情况。
+
+想看面板实际用的是哪份凭据，看日志第一行：`🔑 模型凭据来自：…`。
+
+面板变成孤儿进程时（很久以前用 `&` 后台化、又关了终端的那种）：
 
 ```bash
 lsof -ti tcp:8766 | xargs kill
 ```
 
-**别用 `pkill -f "python app.py"`**——venv 里的 python 实际解析到系统 framework 的
-`Python`（大写 P），按进程名匹配打不中，会以为杀掉了其实没有。按端口找才可靠。
+**别用 `pkill -f "python app.py"`**——macOS 上的 `python3` 是个壳，真进程叫
+`Python`（大写 P），按小写的进程名匹配打不中，会以为杀掉了其实没有。
+按端口找才可靠。
 
 ## 个性化：画像与课程表
 

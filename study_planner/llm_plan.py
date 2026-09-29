@@ -174,7 +174,7 @@ def credential_hint() -> str:
     return (
         "没有找到模型凭据。任选一种办法：\n"
         f"  1. 跑一次配置脚本（推荐，会写 {config.ENV_PATH}，权限 600）：\n"
-        "       .venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py\n"
+        "       python3 .claude/skills/study-planner-setup/scripts/onboard.py\n"
         "  2. 在你的终端里 export 之后重启面板：\n"
         "       export ANTHROPIC_AUTH_TOKEN=<你的 key>\n"
         "       export ANTHROPIC_BASE_URL=<兼容端点，比如 https://api.deepseek.com/anthropic>\n"

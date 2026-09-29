@@ -19,34 +19,41 @@
 在这个仓库目录里打开 Claude Code，说一句「**这个仓库怎么跑**」，
 或者输入 `/study-planner-setup`。它会：
 
-1. **体检** —— 检查 Python 版本、venv、依赖，以及已有的 API key **能不能真的调通**
-2. **缺什么装什么** —— 建 `.venv`、按 `requirements.txt` 装依赖（幂等，重复跑不会重装）
+1. **体检** —— 检查 Python 版本、pip、依赖，以及已有的 API key **能不能真的调通**
+2. **缺什么装什么** —— 把 `requirements.txt` 里的依赖 pip 装到手边的 `python3`（幂等，重复跑不会重装）
 3. **凭据已经能用的话就直接跳到启动**，不会让你再配一遍
 4. 需要配的话，把一条命令交给你 —— **你在自己的终端里**填 key，
    key 不经过对话，也不会被写进会话记录
-5. 告诉你启动命令
+5. **直接帮你把面板起起来**（后台启动，Claude Code 关掉也不影响），告诉你地址
 
 背后的脚本也可以单独跑，不依赖 Claude Code：
 
 ```bash
 python3 .claude/skills/study-planner-setup/scripts/onboard.py --check     # 体检 + 验证 key
-python3 .claude/skills/study-planner-setup/scripts/onboard.py --install   # 只建环境
-.venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py    # 交互式配凭据
+python3 .claude/skills/study-planner-setup/scripts/onboard.py --install   # 只装依赖
+python3 .claude/skills/study-planner-setup/scripts/onboard.py             # 交互式配凭据
 ```
 
 ### 方式二：手动三步
 
 ```bash
-# 建一个独立虚拟环境（这个项目不依赖别的仓库）
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+# 装依赖（只有 flask 和 anthropic 两个）
+python3 -m pip install -r requirements.txt
 
 # 看今天的计划
-.venv/bin/python cli.py today
+python3 cli.py today
 
 # 启动网页面板（推荐用 restart，见下方说明）
-.venv/bin/python cli.py restart     # http://127.0.0.1:8766
+python3 cli.py restart     # http://127.0.0.1:8766
 ```
+
+> **不用建虚拟环境。** 依赖就两个，直接装进系统 python 最省事，也省掉换机器时
+> 最容易卡住的一步（Debian/Ubuntu 上建 venv 要 `sudo apt install python3-venv`）。
+> 系统 python 被 PEP 668 挡住（报 `externally-managed-environment`）时，
+> `onboard.py --install` 会自动退到 `--user`——**任何一步都不需要 sudo**，
+> 也**不要** `sudo pip`。
+>
+> 想装到某个特定的 python，就用那个 python 跑 `onboard.py`，装的和跑的就一定是同一个。
 
 配凭据（面板里「AI 点评」和阅读器问答要用，不配也能跑，只是少了这两块）：
 
@@ -96,7 +103,7 @@ chmod 600 .env
 **手动**：
 
 ```bash
-.venv/bin/python cli.py profile \
+python3 cli.py profile \
   --topics "量子计算与纠错" \
   --level "有量子力学基础，写过 Qiskit，没做过纠错" \
   --goal "能读懂表面码论文并跑通解码器复现" \
@@ -117,9 +124,9 @@ chmod 600 .env
 之后想手动改就直接编辑 `data/curriculum.json`，格式和内字段自解释。
 
 ```bash
-.venv/bin/python cli.py profile              # 看当前画像
-.venv/bin/python cli.py profile --reset      # 删掉生成的，回到内置那份
-.venv/bin/python cli.py check                # 校验当前课程表（含成环/孤立检查）
+python3 cli.py profile              # 看当前画像
+python3 cli.py profile --reset      # 删掉生成的，回到内置那份
+python3 cli.py check                # 校验当前课程表（含成环/孤立检查）
 ```
 
 > ⚠️ 换课程表之后，你原来进度里那些**不在新课程表里的条目会保留在状态文件里**，
@@ -131,9 +138,9 @@ chmod 600 .env
 `data/` 是 gitignore 的，所以**重新 clone 一次进度就没了**。要带走就用：
 
 ```bash
-.venv/bin/python cli.py export               # 默认 ~/study-planner-backup/study-planner-日期.json
-.venv/bin/python cli.py import <包> --dry-run  # 只看会发生什么，不写
-.venv/bin/python cli.py import <包>            # 恢复（有 TTY 会问一次确认）
+python3 cli.py export               # 默认 ~/study-planner-backup/study-planner-日期.json
+python3 cli.py import <包> --dry-run  # 只看会发生什么，不写
+python3 cli.py import <包>            # 恢复（有 TTY 会问一次确认）
 ```
 
 包里装**三样**：进度、画像、生成的课程表。课程表必须装——新机器上没有它，
@@ -170,7 +177,18 @@ python cli.py restart        # 重启网页面板（自动停掉旧的，再前�
 **改了代码之后必须 `restart`** —— Flask 是以 `debug=False` 起的，不会自动重载模块。
 
 `restart` 做三件事：找到占用 8766 端口的进程 → 停掉（普通 kill 不行就 kill -9）→
-**前台**启动新的。前台是刻意的，这样 Ctrl+C 一直有效。
+启动新的。**顶掉旧面板是它的语义，不用先问。**
+
+| 命令 | 启动方式 |
+|---|---|
+| `python3 cli.py restart` | **前台**。Ctrl+C 一直有效，人自己用就选这个 |
+| `python3 cli.py restart -d` | **后台**，起好就返回。Claude Code 之类帮你启动时用这个 |
+| `python3 cli.py stop` | 停掉面板 |
+
+`-d` 起的面板会脱离当前会话，所以 Claude Code 退出、终端关掉都不影响它；
+日志写在 `data/panel.log`。它还会**摘掉 Claude Code 注入的 `ANTHROPIC_*`**，
+让面板用你自己配的那份凭据（否则 AI 帮你起的面板会偷偷用 Claude Code 的身份，
+而体检验的是你配的那份）。人自己敲 `restart` 时不受影响。
 
 如果哪天你用 `&` 把它后台化了、又关掉了终端，进程会变成孤儿。这时手动停：
 
@@ -178,8 +196,8 @@ python cli.py restart        # 重启网页面板（自动停掉旧的，再前�
 lsof -ti tcp:8766 | xargs kill
 ```
 
-**别用 `pkill -f "python app.py"`** —— venv 里的 python 实际解析到系统 framework 的
-`Python`（大写 P），按进程名匹配打不中，会以为杀掉了其实没有。按端口找才可靠。
+**别用 `pkill -f "python app.py"`** —— macOS 上的 `python3` 是个壳，真进程叫
+`Python`（大写 P），按小写的进程名匹配打不中，会以为杀掉了其实没有。按端口找才可靠。
 
 ## 网页面板
 
@@ -318,7 +336,7 @@ SDK 会自动读取这些环境变量，**不需要改代码**。
 配置脚本会一次把该写的键写全，不用手改 `.env`：
 
 ```bash
-.venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py
+python3 .claude/skills/study-planner-setup/scripts/onboard.py
 ```
 
 它会问你用哪家模型、key、模型名，**当场发一次最小请求验证**，再写文件。
