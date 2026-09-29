@@ -1185,4 +1185,8 @@ if __name__ == "__main__":
         print(llm_plan.credential_hint())
 
     print(f"📚 打开浏览器访问 http://{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}  （Ctrl+C 退出）")
-    app.run(host=config.DASHBOARD_HOST, port=config.DASHBOARD_PORT, debug=False)
+    # load_dotenv=False：Flask 自己也会去找 .env，但没装 python-dotenv 时会打印
+    # 「Install python-dotenv to use them」，暗示 .env 没被读取——而实际上
+    # study_planner/__init__.py 已经读了。两套加载器只会互相打脸，关掉 Flask 这套。
+    app.run(host=config.DASHBOARD_HOST, port=config.DASHBOARD_PORT,
+            debug=False, load_dotenv=False)

@@ -1,0 +1,130 @@
+---
+name: study-planner-setup
+description: 帮新克隆 study-planner 仓库的人搞清这个仓库是干什么的、怎么装依赖、怎么配模型凭据、怎么启动网页面板和日常使用。当用户问「这个仓库是干什么的 / 怎么跑起来 / 怎么启动 / 怎么配置环境 / 缺依赖 / 面板起不来 / AI 点评不可用 / 认证失败 / 换台机器怎么装」时使用。Onboarding, environment setup, dependency install, credential configuration (.env, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL), and first run for the study-planner repo.
+---
+
+# study-planner 上手
+
+## 这个仓库是什么
+
+给**端到端自动驾驶 / 强化学习 / VLA** 三个方向排每日学习计划的本地小工具。
+它解决的问题不是「不知道学什么」，而是**没有稳定的每日节奏**：每天从一份带前置依赖的
+课程表里挑 1 篇精读 + 1 个小任务，配一个网页面板读论文、划词问 AI。
+
+数据全在本机（`data/`），不上传任何地方。深度说明见仓库根的 `README.md`。
+
+## 三条铁律
+
+这几条是硬性的，违反的代价比"做不完任务"大得多。
+
+**1. 绝不通过对话收集 API key。**
+不要 `AskUserQuestion` 问 key，不要让用户把 key 贴在聊天里，不要用 Bash 命令
+（`echo $KEY`、`read`、heredoc）去接 key，也不要回显任何看起来像 key 的字符串。
+key 一旦出现在对话里，就会被**发送给模型提供方**并写进会话记录文件。
+`scripts/onboard.py` 已经设计成"用户在自己的终端里用 `getpass` 输"——把命令交给他就行。
+
+**2. 绝不运行 `cli.py restart` 或 `cli.py today`。**
+`restart` 会杀掉用户**正在使用**的面板进程（先 `lsof -ti tcp:8766` 看一眼，只报告不 kill）；
+`today` 会调 `prog.record_day()` + `save()`，覆写 `data/state.json` 里当天的记录。
+要启动面板，把命令给用户让他自己跑。
+
+**3. 绝不用环境变量判断"凭据配好了没"。**
+Claude Code 会把**它自己那份** `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL`
+注入给子进程（实测 `CLAUDECODE=1` 时这两个都是设好的）。拿 `os.environ` 当判据，
+会给一个从没配过任何东西的用户报"已配置好"。
+`onboard.py` 只认**持久化来源**（`.env` 文件 或 `~/.claude/settings.json` 的 `env` 块），
+直接用它，不要自己写探测。
+
+## 三步走
+
+**第一步：体检 —— 它同时验证 key 能不能真的用。**
+
+```bash
+python3 .claude/skills/study-planner-setup/scripts/onboard.py --check
+```
+
+只读，不改任何东西，但**会真发一次最小请求验证凭据**（最长等 20 秒）。
+这一步就够了：**只要退出码是 `0`，直接跳到第三步启动，不要进第二步。**
+用户如果本来就配好了、能跑通，就完全不该看到"配置凭据"这一步。
+
+| 退出码 | 含义 | 下一步 |
+|---|---|---|
+| `0` | 环境齐 + 凭据**验证通过** | **直接进第三步**，不要再提配置凭据 |
+| `1` | 环境坏了（缺 venv 或依赖） | 跑下面的 `--install` |
+| `2` | 需要交互式终端 | 把输出里的命令原样交给用户 |
+| `3` | 没有凭据，或 key 被端点拒绝 | 进第二步 |
+| `4` | 凭据有效，只是模型名不对 | 改 `STUDY_PLANNER_MODEL` 那一行即可，**不要**让用户重配 key |
+| `5` | 凭据配了，但这次连不上端点没验成 | 可以照常启动，提醒一句「AI 报错就重跑配置」 |
+
+**只有退出码是 `1` 时**才装依赖（幂等，可以反复跑）：
+
+```bash
+python3 .claude/skills/study-planner-setup/scripts/onboard.py --install
+```
+
+退出码 `4` / `5` 都不是"凭据有问题"：`4` 是模型名，`5` 多半是网络。
+别把它们当成 `3` 去让用户重新粘 key——那会让人白跑一趟。
+
+**第二步：配凭据 —— 把命令交给用户，让他自己跑。**
+只有第一步返回 `3` 才走到这里。这一步必须由用户在**自己的终端**里完成，
+因为他要交互式输入 key，而 AI 这边没有终端（也不该有，原因见铁律 1）。
+把下面这段**原样**给他，并说明为什么：
+
+> 请新开一个终端窗口，粘贴这条命令，按提示填（会问你用哪家模型、key、模型名，
+> 输入 key 时不会回显）：
+>
+> ```bash
+> cd <仓库根目录绝对路径>
+> .venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py
+> ```
+>
+> 脚本会当场发一次最小请求验证 key，然后把配置写进 `.env`（权限 600，已被 gitignore）。
+> 不要在这个对话里粘贴 key —— 那会被发送给模型提供方并留在记录里。
+
+**第三步：启动。** 环境齐、凭据也验过了，**由用户**执行：
+
+```bash
+.venv/bin/python cli.py restart     # http://127.0.0.1:8766
+```
+
+`.env` 只在进程启动时读一次，所以**改完凭据必须 restart 才生效**。
+
+## 日常使用
+
+| 命令 | 作用 |
+|---|---|
+| `python cli.py today` | 今天的计划（精读 / 小任务 / 复习 / 新鲜事） |
+| `python cli.py next` | 预告接下来推什么 |
+| `python cli.py done <id>` | 标记完成（`<id>` 支持只写前缀） |
+| `python cli.py shaky <id>` | 标记「没读懂」，3 天后重推 |
+| `python cli.py status` | 总体进度 + 连续天数 |
+| `python cli.py restart` | 起/重启网页面板（8766） |
+| `python cli.py check` | 课程表自检（依赖成环 / id 重复） |
+
+面板里 `/read/<id>` 是**论文阅读器**：左边原文，右边问 AI。
+**用鼠标选中左边任意一段会浮出「问 AI」**，点一下就能就着那段话提问。
+右上角「原文 ↗」指向真正的 arXiv 页面。
+
+AI 功能（每日点评 + 阅读器问答）是可选的——没配凭据也能用，只是少了这两块。
+
+## 出问题了
+
+| 现象 | 先看这里 |
+|---|---|
+| `Could not resolve authentication method` | `.env` 没生效：是不是 shell 里也 export 了同名变量（环境变量优先）？改完 restart 了吗？ |
+| 面板起来了但点评是模板文字 | 没配凭据，或者 key 不对。跑 `onboard.py` 重配一次 |
+| 端口 8766 被占 | `lsof -ti tcp:8766`，**别自动 kill**，先问用户 |
+| 依赖装不上 | 看 `--install` 的 pip 输出；Debian/Ubuntu 可能要 `apt install python3-venv` |
+| 论文左栏空白 | 断网或 arXiv 没有 HTML 版；左栏会显示说明页，不是白屏 |
+| 改了 `.env` 但没变化 | 它在进程启动时读一次，必须 restart |
+
+更细的对照表、凭据优先级矩阵、手动配置方式和调参说明在 `reference.md`，
+需要时再读，不要一次全加载。
+
+## 不要做的事
+
+- 不要往 `~/.claude/settings.json` 写凭据——那是 Claude Code **自己**的配置，
+  写坏会连带影响用户的 Claude Code。（工具会自动读它，但只读不写。）
+- 不要直接编辑 `.env`，交给 `onboard.py`，它会保留文件里的其它内容（比如 `GITHUB_TOKEN`）。
+- 不要在输出里回显 key 的任何完整形式。
+- 不要在用户没要求时跑 `pip install`——`--check` 说没问题就别动。

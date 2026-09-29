@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
+from . import config
 from .knowledge import TRACK_BY_ID
 
 # 默认用 Claude Opus 4.8（官方推荐默认档位）。
@@ -92,6 +93,13 @@ def _ensure_credentials() -> str:
     global CREDENTIAL_SOURCE
 
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        # 别把「项目 .env」说成「环境变量」。两者排查方向完全不同：
+        # 环境变量可能是你在 shell profile 里 export 的、也可能是别人给的；
+        # .env 是你自己（或配置脚本）写在这个仓库里的一个文件。
+        # 启动横幅（app.py 里的「🔑 模型凭据来自：」）就靠这里报准。
+        if config.ENV_APPLIED_KEYS:
+            CREDENTIAL_SOURCE = CREDENTIAL_SOURCE or str(config.ENV_PATH)
+            return CREDENTIAL_SOURCE
         CREDENTIAL_SOURCE = CREDENTIAL_SOURCE or "环境变量"
         return ""
 
@@ -123,14 +131,17 @@ def credential_hint() -> str:
     """没有任何可用凭据时，给用户看的可操作提示。"""
     return (
         "没有找到模型凭据。任选一种办法：\n"
-        "  1. 在你的终端里设置后重启面板：\n"
+        f"  1. 跑一次配置脚本（推荐，会写 {config.ENV_PATH}，权限 600）：\n"
+        "       .venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py\n"
+        "  2. 在你的终端里 export 之后重启面板：\n"
         "       export ANTHROPIC_AUTH_TOKEN=<你的 key>\n"
         "       export ANTHROPIC_BASE_URL=<兼容端点，比如 https://api.deepseek.com/anthropic>\n"
         "     （用官方 Anthropic 的话只设 ANTHROPIC_API_KEY 即可）\n"
-        "  2. 写进 ~/.claude/settings.json 的 env 块里 —— 本工具会自动读取\n"
+        "  3. 写进 ~/.claude/settings.json 的 env 块里 —— 本工具会自动读取\n"
         "\n"
         "注意：Claude Code 自己进程里的环境变量不会传给你手动启动的程序，\n"
-        "所以「在 Claude Code 里能用」不代表这里能用。"
+        "所以「在 Claude Code 里能用」不代表这里能用。\n"
+        "另外改了 .env 要重启面板才生效——它只在进程启动时读一次。"
     )
 
 

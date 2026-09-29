@@ -14,7 +14,15 @@ venv/
 # 换台机器重新积累即可，不需要跟着代码走。
 data/
 
-# 本机设置
+# 本机凭据。**必须忽略**：这个文件里是 API key，提交上去就等于泄露。
+# 配置脚本 .claude/skills/study-planner-setup/scripts/onboard.py 会写它，权限 600。
+.env
+.env.local
+# 但模板要留着——它是给人看格式用的，里面没有任何真实密钥
+!.env.example
+
+# 本机设置。注意只忽略这一个文件：.claude/skills/ 要跟着仓库走，
+# onboarding skill 就住在里面，整个 .claude/ 忽略掉就分享不出去了。
 .claude/settings.local.json
 
 # 系统 / 编辑器

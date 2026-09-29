@@ -27,6 +27,13 @@
 
 ## 快速开始
 
+**在 Claude Code 里打开这个仓库**，直接说「这个仓库怎么跑」，或者输入
+`/study-planner-setup`。它会检查 Python 版本、建 venv、按 `requirements.txt`
+装依赖，然后让你**在自己的终端里**填一次 API key（key 不会经过对话），
+最后告诉你启动命令。
+
+不想用 Claude Code 的话，手动三步：
+
 ```bash
 # 建一个独立虚拟环境（这个项目不依赖别的仓库）
 python3 -m venv .venv
@@ -197,24 +204,52 @@ SDK 会自动读取这些环境变量，**不需要改代码**。
 
 ### 凭据从哪来（一个很容易踩的坑）
 
-按这个顺序找：
+按这个顺序找，**前一条命中就不再看后面的**：
 
-1. **当前环境变量** —— 你 `export` 的，或终端 profile 里的
-2. **`~/.claude/settings.json` 的 `env` 块** —— 找不到就自动读这里补齐
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | 当前环境变量 | 你 `export` 的，或终端 profile 里的。优先级最高，**`.env` 覆盖不了它** |
+| 2 | 项目根目录的 `.env` | 推荐。配置脚本写入，权限 600，已被 `.gitignore` 忽略 |
+| 3 | `~/.claude/settings.json` 的 `env` 块 | 兜底。依次尝试它、`~/.claude.json`、`<root>/.claude/settings.json` |
 
-第 2 条是必需的，因为 Claude Code 把凭据配在它自己的配置文件里，只注入给
+配置脚本会一次把该写的键写全，不用手改 `.env`：
+
+```bash
+.venv/bin/python .claude/skills/study-planner-setup/scripts/onboard.py
+```
+
+它会问你用哪家模型、key、模型名，**当场发一次最小请求验证**，再写文件。
+验证结果分四类报，不会混成一句话：
+
+- **401/403** → key 无效，**不写文件**（免得把原本能用的配置搞坏）
+- **404 / 模型名不认识** → 凭据是好的、只是模型名不对，照写并提示改模型名
+- **连不上** → 问一次要不要照写
+- **429** → 凭据可用，只是被限流
+
+第 2 条为什么要存在：Claude Code 把凭据配在它自己的配置文件里，只注入给
 **它自己的进程**，不会传给你手动启动的程序。于是就会出现：
 
 > 在 Claude Code 里让 AI 测着好好的，你自己 `cli.py restart` 一跑就报
 > `TypeError: Could not resolve authentication method`
 
-所以本工具启动时会**打印凭据来源**，第一眼就能看出对不对：
+所以本工具启动时会**打印凭据来源**（目前只有 `app.py` 打印，`cli.py` 不打印），
+第一眼就能看出对不对：
 
 ```
-🔑 模型凭据来自：/Users/you/.claude/settings.json
+🔑 模型凭据来自：/Users/you/study-planner/.env
 ```
 
 没找到凭据时也会给出具体该怎么办，而不是等你在浏览器里提问才炸。
+
+#### 两个最常见的坑
+
+**坑一：shell 里 export 过，`.env` 就不生效。** 加载器刻意**不覆盖**已存在的
+环境变量（你手动 export 的值优先级最高）。所以「我跑了配置脚本但没变化」，
+通常要先 `unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL`，
+或者改 shell profile。配置脚本检测到这种情况会主动警告。
+
+**坑二：`.env` 只在进程启动时读一次。** 改完必须 `cli.py restart`——
+和「改了代码必须 restart」是同一类坑。
 
 另外注意：Anthropic SDK 的构造函数在**没有凭据时不报错**，要等到真正发请求
 才抛异常。所以判断「有没有凭据」不能靠 `try: Anthropic() except:`，必须主动检查
@@ -289,6 +324,14 @@ python cli.py check-links   # 逐个 HEAD 校验，失效的写进 data/dead_lin
 study-planner/              # ← 项目根目录
 ├── cli.py                  # 命令行入口
 ├── app.py                  # Flask 网页面板
+├── requirements.txt        # 只有 flask 和 anthropic
+├── .env.example            # 凭据模板（入库，无密钥）
+├── .env                    # 真正的凭据（gitignored，权限 600）
+├── .claude/skills/study-planner-setup/
+│   │                       # ★ onboarding skill：装环境、配凭据、起面板
+│   ├── SKILL.md            #   给 AI 看的流程
+│   ├── reference.md        #   按需查的详细参考
+│   └── scripts/onboard.py  #   体检 / 建环境 / 交互式配凭据（只用标准库）
 ├── data/
 │   ├── state.json          # 进度状态（CLI 和面板共用的唯一数据源）
 │   ├── cache/              # arXiv / GitHub 当日缓存
